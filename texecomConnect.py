@@ -837,6 +837,13 @@ class TexecomConnect(object):
                 except socket.timeout:
                     # we didn't send any command, so a timeout is the expected result, continue our loop
                     continue
+                except socket.error as e:
+                    self.log("Socket error - disconnect & try again")
+                    self.closesocket()
+                    break
+
+                except Exception as e:
+                    self.log("Exception %s" % str(e))
 
     def decode_message_to_text(self, payload):
         msg_type, payload = payload[0], payload[1:]
