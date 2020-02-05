@@ -793,6 +793,10 @@ class TexecomConnect(object):
                 connected = False
                 notifiedConnectionLoss = False
                 self.log("Connection lost")
+                sleep_time = 5
+            else:
+                sleep_time = sleep_time * 2
+
             connectionLostTime = time.time() - lastConnectedAt
             if connectionLostTime >= 60 and not notifiedConnectionLoss:
                 self.log("Connection lost for over 60 seconds - calling send-message.sh")
@@ -801,13 +805,13 @@ class TexecomConnect(object):
             try:
                 self.connect()
             except socket.error as e:
-                self.log("Connect failed - {}; sleeping for 5 seconds".format(e))
-                time.sleep(5)
+                self.log("Connect failed - %s; sleeping for %d seconds" % (str(e), sleep_time))
+                time.sleep(sleep_time)
                 continue
             if not self.login():
                 self.log(
-                    "Login failed - udl password incorrect, pre-v4 panel, or trying to connect too soon: closing socket, try again 5 in seconds")
-                time.sleep(5)
+                    "Login failed - udl password incorrect, pre-v4 panel, or trying to connect too soon: closing socket, try again %d in seconds" % (sleep_time))
+                time.sleep(sleep_time)
                 self.closesocket()
                 continue
             self.log("login successful")
