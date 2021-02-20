@@ -76,7 +76,7 @@ class TexecomMqtt:
             HAZoneType = "motion"
         name = str.lower((zone.text).replace(" ", "_"))
         topicbase = topic_root + "/binary_sensor/" + name
-        configtopic = topicbase + "/config"
+        configtopic = config_root + "/binary_sensor/" + name + "/config"
         statetopic = topicbase + "/state"
         message = {
             "name": name,
@@ -101,7 +101,7 @@ class TexecomMqtt:
     def area_details_callback(area, panelType, numberOfZones):
         name = str.lower((area.text).replace(" ", "_"))
         topicbase = topic_root + "/alarm_control_panel/" + name
-        configtopic = topicbase + "/config"
+        configtopic = config_root + "/alarm_control_panel/" + name + "/config"
         statetopic = topicbase + "/state"
         commandtopic = topicbase + "/command"
         message = {
@@ -198,7 +198,7 @@ class Unbuffered:
 if __name__ == "__main__":
     # Texecom config
     texhost = os.getenv("TEXHOST", "192.168.1.1")
-    texport = os.getenv("TEXPORT", 10001)
+    texport = int(os.getenv("TEXPORT", 10001))
     # This is the default UDL password for a factory panel. For any real
     # installation, use wintex to set the UDL password in the panel to a
     # random 16 character alphanumeric string.
@@ -209,6 +209,7 @@ if __name__ == "__main__":
     broker_user = os.getenv("BROKER_USER", None)
     broker_pass = os.getenv("BROKER_PASS", None)
     topic_root = os.getenv("MQTT_ROOT_TOPIC", "homeassistant")
+    config_root = os.getenv("MQTT_CONFIG_TOPIC", "homeassistant")
     # This is the name of your Areas for arm/disarm via mqtt. They are mapped onto the equivlent areamap.
     # example of MQTT_AREAS and MQTT_AREAMAPS below defines (in order) Area1-4 ('all'), Area1('ground_floor'), Area2('upstairs'), Area3('outside'), Area4('shed')
     topic_subs = os.getenv(
