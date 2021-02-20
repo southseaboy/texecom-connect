@@ -311,7 +311,7 @@ class TexecomConnect(TexecomDefines):
             2000 + datetimeresp[2],
             datetimeresp[1],
             datetimeresp[0],
-            (*datetimeresp[3:]),
+            *datetimeresp[3:],
         )
         seconds = int((paneltime - datetime.datetime.now()).total_seconds())
         if seconds > 0:
@@ -413,13 +413,20 @@ class TexecomConnect(TexecomDefines):
         """CMD_GETZONECHANGES"""
         details = self.sendcommand(self.CMD_GETZONECHANGES, None)
         if details is None:
+            self.log("GZC_none")
             return None
-        if len(details) == self.zoneBitmapSize + 2:
+        if len(details) == self.zoneBitmapSize:  # was zoneBitmapSize + 2
             changedZonesBitmap = details
+            if self.log_verbose:
+                    self.log(
+                        "GETZONECHANGES {:d}: 0x{}".format(
+                            self.zoneBitmapSize, changedZonesBitmap.hex()
+                        )
+                    )
             return changedZonesBitmap
         else:
             self.log(
-                "GETAREAFLAGS: response wrong length: {:d}/{:d} ".format(
+                "GETZONECHANGES: response wrong length: {:d}/{:d} ".format(
                     len(details), self.zoneBitmapSize
                 )
             )
@@ -936,7 +943,9 @@ class TexecomConnect(TexecomDefines):
                     return None
             if time.time() - self.time_last_heartbeat > self.alive_heartbeat_secs:
                 self.alive()
-            header = self.s.recv(self.LENGTH_HEADER)
+            #header = self.s.recv(self.LENGTH_HEADER)
+            length = self.LENGTH_HEADER
+            header = self.buffered_recv(length)
             if self.print_network_traffic:
                 self.log("Received message header:")
                 hexdump.hexdump(header)
@@ -973,7 +982,8 @@ class TexecomConnect(TexecomDefines):
                 hexdump.hexdump(header)
                 return None
             expected_len = msg_length - self.LENGTH_HEADER
-            payload = self.s.recv(expected_len)
+            #payload = self.s.recv(expected_len)
+            payload = self.buffered_recv(expected_len)
             if self.print_network_traffic:
                 self.log("Received message payload:")
                 hexdump.hexdump(payload)
@@ -1101,6 +1111,21 @@ class TexecomConnect(TexecomDefines):
         nextseq = self.nextseq
         self.nextseq += 1
         return nextseq
+
+    # buffered receive for DIY network comports
+    def buffered_recv(self, length):
+        buf = bytearray()
+        while length:
+            newbuf = self.s.recv(length)
+            if not newbuf:
+                self.log("Nothing in recv buffer for header, closing connection")
+                self.closesocket
+                return None
+            buf.extend(newbuf)
+            length -= len(newbuf)
+        return buf
+
+
 
     ### General helpers
 

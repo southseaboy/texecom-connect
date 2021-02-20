@@ -197,22 +197,22 @@ class Unbuffered:
 
 if __name__ == "__main__":
     # Texecom config
-    texhost = os.getenv("TEXHOST", "192.168.1.9")
-    texport = os.getenv("TEXPORT", 10001)
+    texhost = os.getenv("TEXHOST", "10.0.0.241")
+    texport = os.getenv("TEXPORT", 10046)
     # This is the default UDL password for a factory panel. For any real
     # installation, use wintex to set the UDL password in the panel to a
     # random 16 character alphanumeric string.
     udlpassword = os.getenv("UDLPASSWORD", "1234")
     # MQTT config
-    broker_url = os.getenv("BROKER_URL", "192.168.1.1")
+    broker_url = os.getenv("BROKER_URL", "10.0.50.5")
     broker_port = os.getenv("BROKER_PORT", 1883)
     broker_user = os.getenv("BROKER_USER", None)
     broker_pass = os.getenv("BROKER_PASS", None)
-    topic_root = os.getenv("MQTT_ROOT_TOPIC", "homeassistant")
+    topic_root = os.getenv("MQTT_ROOT_TOPIC", "texetest")
     # This is the name of your Areas for arm/disarm via mqtt. They are mapped onto the equivlent areamap.
     # example of MQTT_AREAS and MQTT_AREAMAPS below defines (in order) Area1-4 ('all'), Area1('ground_floor'), Area2('upstairs'), Area3('outside'), Area4('shed')
     topic_subs = os.getenv(
-        "MQTT_AREAS", "all,ground_floor,upstairs,outside,shed"
+        "MQTT_AREAS", "all,intruder,fire_gas_alarm,unused_3,unused_4"
     ).split(",")
     topic_areamaps = os.getenv(
         "MQTT_AREAMAPS",
