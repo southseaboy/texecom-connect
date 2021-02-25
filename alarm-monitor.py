@@ -197,14 +197,14 @@ class Unbuffered:
 
 if __name__ == "__main__":
     # Texecom config
-    texhost = os.getenv("TEXHOST", "192.168.1.1")
-    texport = int(os.getenv("TEXPORT", 10001))
+    texhost = os.getenv("TEXHOST", "192.168.0.2")
+    texport = int(os.getenv("TEXPORT", 10000))
     # This is the default UDL password for a factory panel. For any real
     # installation, use wintex to set the UDL password in the panel to a
     # random 16 character alphanumeric string.
     udlpassword = os.getenv("UDLPASSWORD", "1234")
     # MQTT config
-    broker_url = os.getenv("BROKER_URL", "192.168.1.2")
+    broker_url = os.getenv("BROKER_URL", "192.168.1.1")
     broker_port = os.getenv("BROKER_PORT", 1883)
     broker_user = os.getenv("BROKER_USER", None)
     broker_pass = os.getenv("BROKER_PASS", None)
@@ -219,7 +219,7 @@ if __name__ == "__main__":
         "MQTT_AREAMAPS",
         "0F000000000000,01000000000000,02000000000000,04000000000000,08000000000000",
     ).split(",")
-
+ 
     sys.stdout = Unbuffered(sys.stdout)
 
     client = paho.Client()
