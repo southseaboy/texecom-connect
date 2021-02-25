@@ -319,7 +319,38 @@ class TexecomConnect(TexecomDefines):
         else:
             diff = " (panel is behind by {:d} seconds)".format(-seconds)
         self.log("Panel date/time: " + datetimestr + diff)
+        
+        maxclockerror = int (os.getenv("MAXCLOCKERROR", 5)) # panel clock will be corrected to os clock if error > 5 secs
+        if seconds > maxclockerror:
+            # correct the clock
+            boolresult = self.set_date_time()
+            if boolresult:
+                result = "success"
+            else:
+                result = "failed"    
+            self.log("Trying to correct panel time: " + result )
+
         return datetimestr
+
+    def set_date_time(self):
+        """CMD_SETDATETIME"""
+        now = datetime.datetime.now()
+        datelist = [now.day,now.month,now.year-2000,now.hour,now.minute,now.second]
+        nowbytes = bytes(datelist)
+
+        response = self.sendcommand(self.CMD_SETDATETIME, nowbytes)
+        if response is None:
+            self.log("sendcommand returned None for set date-time")
+            return False
+        if response == self.CMD_RESPONSE_NAK:
+            self.log("NAK response from panel")
+            return False
+        elif response != self.CMD_RESPONSE_ACK:
+            self.log("unexpected ack payload: " + str(response))
+            return False
+        return True
+
+
 
     def get_system_power(self):
         """CMD_GETSYSTEMPOWER"""

@@ -37,6 +37,7 @@ class TexecomDefines:
     CMD_GETLOGPOINTER = bytes([15])
     CMD_GETPANELIDENTIFICATION = bytes([22])
     CMD_GETDATETIME = bytes([23])
+    CMD_SETDATETIME = bytes([24])
     CMD_GETSYSTEMPOWER = bytes([25])
     CMD_GETUSER = bytes([27])
     CMD_GETAREADETAILS = bytes([35])
