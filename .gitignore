@@ -1,4 +1,8 @@
 *~
 *.pyc
 docker-compose_local.yaml
+Texecom Connect Protocol Payload Specification.pdf
+Texecom Connect Protocol Specification.pdf
 Dockerfile_ENV
+.env
+Panel_Log_Example.Txt

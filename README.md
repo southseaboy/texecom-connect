@@ -63,3 +63,10 @@ The NDA was not clear as to whether software that used the information received 
 > I have spoken to the team who approve the NDA’s and they have stated that you are able to release your program but you cannot disclose details of the protocol documentation.
 
 Whilst still slightly oddly worded, they do say they are happy with me releasing this python code.
+
+## Recent changes (developer notes)
+
+- Added per-device MQTT discovery identifiers so Home Assistant can show each physical sensor/keypad/area as a separate device. See `alarm-monitor.py` for the new `device.identifiers` format (panel id + per-device id).
+- Added retained battery discovery config placeholders for zones and areas. A proposal describing topics, payloads, and implementation notes is in `BATTERY_MQTT_PROPOSAL.md`.
+- Behaviour note: changing `device.identifiers` will cause Home Assistant to treat entities as belonging to new devices. Remove or migrate old devices in HA after deploying these changes to avoid duplicates.
+

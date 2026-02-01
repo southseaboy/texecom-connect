@@ -22,10 +22,34 @@ import os
 import sys
 import json
 import atexit
+import re
 
 from texecomConnect import TexecomConnect
 
 import paho.mqtt.client as paho
+ 
+# cached panel identifier (populated lazily)
+PANEL_IDENT = None
+
+
+def get_panel_identifier():
+    """Return a stable panel identifier string. Cached after first fetch."""
+    global PANEL_IDENT, tc
+    if PANEL_IDENT is not None:
+        return PANEL_IDENT
+    try:
+        if 'tc' in globals() and tc is not None:
+            pid = tc.get_panel_identification()
+            if pid is None:
+                PANEL_IDENT = "unknown_panel"
+            else:
+                # make a short safe id
+                PANEL_IDENT = re.sub(r"\W+", "_", pid).strip()
+        else:
+            PANEL_IDENT = "unknown_panel"
+    except Exception:
+        PANEL_IDENT = "unknown_panel"
+    return PANEL_IDENT
 
 
 class TexecomMqtt:
@@ -34,6 +58,8 @@ class TexecomMqtt:
 
     @staticmethod
     def on_connect(client, userdata, flags, rc):
+        if TexecomMqtt.log_mqtt_traffic:
+            print("MQTT broker connection made")
         if len(topic_subs[0]) > 0:
             client.subscribe(topic_root + "/alarm_control_panel/+/command/#")
 
@@ -78,6 +104,13 @@ class TexecomMqtt:
         topicbase = topic_root + "/binary_sensor/" + name
         configtopic = config_root + "/binary_sensor/" + name + "/config"
         statetopic = topicbase + "/state"
+        panel_ident = get_panel_identifier()
+        device = {
+            "name": "Texecom " + panelType + " " + str(numberOfZones),
+            "identifiers": ["texecom", panel_ident, f"zone:{zone.number}"],
+            "manufacturer": "Texecom",
+            "model": panelType + " " + str(numberOfZones),
+        }
         message = {
             "name": name,
             "device_class": HAZoneType,
@@ -85,16 +118,22 @@ class TexecomMqtt:
             "payload_on": "True",
             "payload_off": "False",
             "unique_id": ".".join([panelType, name]),
-            "device": {
-                "name": "Texecom " + panelType + " " + str(numberOfZones),
-                "identifiers": "123456789",  # TODO panel serial number?
-                "manufacturer": "Texecom",
-                "model": panelType + " " + str(numberOfZones)
-            }
+            "device": device,
         }
         if TexecomMqtt.log_mqtt_traffic:
             print("MQTT Update %s: %s" % (configtopic, json.dumps(message)))
         client.publish(configtopic, json.dumps(message), retain=True)
+        # publish battery discovery config placeholder (retained)
+        battery_config_topic = config_root + "/sensor/" + name + "/config"
+        battery_message = {
+            "name": name + "_battery",
+            "state_topic": topic_root + "/sensor/" + name + "/state",
+            "unit_of_measurement": "%",
+            "device_class": "battery",
+            "unique_id": ".".join([panelType, name, "battery"]),
+            "device": device,
+        }
+        client.publish(battery_config_topic, json.dumps(battery_message), retain=True)
         return zone
 
     @staticmethod
@@ -104,17 +143,19 @@ class TexecomMqtt:
         configtopic = config_root + "/alarm_control_panel/" + name + "/config"
         statetopic = topicbase + "/state"
         commandtopic = topicbase + "/command"
+        panel_ident = get_panel_identifier()
+        device = {
+            "name": "Texecom " + panelType + " " + str(numberOfZones),
+            "identifiers": ["texecom", panel_ident, f"area:{area.number}"],
+            "manufacturer": "Texecom",
+            "model": panelType + " " + str(numberOfZones),
+        }
         message = {
             "name": name,
             "state_topic": statetopic,
             "command_topic": commandtopic,
             "unique_id": ".".join([panelType, "area", name]),
-            "device": {
-                "name": "Texecom " + panelType + " " + str(numberOfZones),
-                "identifiers": "123456789",  # TODO panel serial number?
-                "manufacturer": "Texecom",
-                "model": panelType + " " + str(numberOfZones)
-            }
+            "device": device,
         }
         if TexecomMqtt.log_mqtt_traffic:
             print("MQTT Update %s: %s" % (configtopic, json.dumps(message)))
@@ -208,7 +249,7 @@ if __name__ == "__main__":
     broker_port = os.getenv("BROKER_PORT", 1883)
     broker_user = os.getenv("BROKER_USER", None)
     broker_pass = os.getenv("BROKER_PASS", None)
-    topic_root = os.getenv("MQTT_ROOT_TOPIC", "homeassistant")
+    topic_root = os.getenv("MQTT_ROOT_TOPIC", "alarm_unconfig")
     config_root = os.getenv("MQTT_CONFIG_TOPIC", "homeassistant")
     # This is the name of your Areas for arm/disarm via mqtt. They are mapped onto the equivlent areamap.
     # example of MQTT_AREAS and MQTT_AREAMAPS below defines (in order) Area1-4 ('all'), Area1('ground_floor'), Area2('upstairs'), Area3('outside'), Area4('shed')
@@ -228,6 +269,8 @@ if __name__ == "__main__":
     client.on_connect = TexecomMqtt.on_connect
     client.will_set(topic_root + "/alarm_control_panel/state", "offline")
     print("connecting to broker ", broker_url)
+    if TexecomMqtt.log_mqtt_traffic:
+        print("user: " + broker_user + " // password: " + broker_pass)
     client.connect(broker_url, broker_port)
     client.loop_start()
 
