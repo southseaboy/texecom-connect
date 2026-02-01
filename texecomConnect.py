@@ -57,6 +57,7 @@ class TexecomConnect(TexecomDefines):
         self.area_details_func = None
         self.zone_details_func = None
         self.zone_event_func = None
+        self.battery_event_func = None
         self.log_event_func = None
         self.numberOfZones = None
         self.highestUsedZone = None
@@ -694,6 +695,9 @@ class TexecomConnect(TexecomDefines):
     def on_log_event(self, log_event_func):
         self.log_event_func = log_event_func
 
+    def on_battery_event(self, battery_event_func):
+        self.battery_event_func = battery_event_func
+
     def enable_output_events(self, yes):
         self.requestPanelOutputEvents = (yes == True)
 
@@ -850,6 +854,24 @@ class TexecomConnect(TexecomDefines):
                 group_type_str += " [comm delayed]"
             if communicated:
                 group_type_str += " [communicated]"
+            # Invoke a battery-specific callback for relevant log events (low/restore)
+            # Common battery-related event types include 48 (Low Battery) and 99 (RF Device Low Battery).
+            try:
+                group_type_val = group_type
+            except Exception:
+                group_type_val = None
+            # group_type == 4 indicates a 'Restore' in log_event_group_type
+            is_restore = (group_type_val == 4)
+            if event_type in (48, 99):
+                # parameter commonly holds the device/zone number
+                if self.battery_event_func is not None:
+                    try:
+                        device_id = parameter
+                        low = not is_restore
+                        # callback signature: func(device_id, low_bool, event_type)
+                        self.battery_event_func(device_id, low, event_type)
+                    except Exception:
+                        pass
 
             return "Log event message: {} {}, {} parameter: {:d} areas: {:d}".format(
                 timestamp_str, event_str, group_type_str, parameter, areas

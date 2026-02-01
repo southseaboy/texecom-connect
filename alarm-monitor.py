@@ -210,6 +210,38 @@ class TexecomMqtt:
         client.publish(topic, message)
 
     @staticmethod
+    def battery_event(device_number, low, event_type):
+        # Publish a binary low-battery sensor for the device identified by device_number
+        try:
+            zone = tc.get_zone(device_number)
+            name = str.lower((zone.text).replace(" ", "_"))
+        except Exception:
+            # fallback to numeric id
+            name = f"zone_{device_number}"
+        panelType = tc.panelType if hasattr(tc, 'panelType') and tc.panelType is not None else "Texecom"
+        panel_ident = get_panel_identifier()
+        device = {
+            "name": "Texecom " + panelType + " " + str(tc.numberOfZones if tc.numberOfZones else ""),
+            "identifiers": ["texecom", panel_ident, f"zone:{device_number}"],
+            "manufacturer": "Texecom",
+            "model": (panelType + " " + str(tc.numberOfZones)) if tc.numberOfZones else panelType,
+        }
+        configtopic = config_root + "/binary_sensor/" + name + "_battery/config"
+        statetopic = topic_root + "/binary_sensor/" + name + "_battery/state"
+        message = {
+            "name": name + "_battery",
+            "state_topic": statetopic,
+            "payload_on": "ON",
+            "payload_off": "OFF",
+            "unique_id": ".".join([panelType, name, "battery_bin"]),
+            "device": device,
+            "device_class": "problem",
+        }
+        client.publish(configtopic, json.dumps(message), retain=True)
+        payload = "ON" if low else "OFF"
+        client.publish(statetopic, payload, retain=True)
+
+    @staticmethod
     def exiting():
         print("exiting")
         TexecomMqtt.log_event("Exiting alarm-monitor.")
@@ -282,6 +314,7 @@ if __name__ == "__main__":
     tc.on_area_details(TexecomMqtt.area_details_callback)
     tc.on_zone_details(TexecomMqtt.zone_details_callback)
     tc.on_log_event(TexecomMqtt.log_event)
+    tc.on_battery_event(TexecomMqtt.battery_event)
 
     atexit.register(TexecomMqtt.exiting)
 
