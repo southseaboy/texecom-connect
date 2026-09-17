@@ -66,6 +66,10 @@ class TexecomConnect(TexecomDefines):
         # last logged area-flag text per area, and when we last forced a re-log
         self.lastAreaFlags = {}
         self.lastAreaFlagsLog = 0
+        # fast flag polling while an area is in alarm
+        self.alarmPollUntil = 0
+        self.alarmPollNext = 0
+        self.alarmPollSweepDone = False
         self.zoneBitmapSize = None
         self.zoneNumSize = None
         self.zones = {}
@@ -690,6 +694,69 @@ class TexecomConnect(TexecomDefines):
         "Seismic Alarm",
     ]
 
+    # While an area is in alarm, poll this wider set every ALARM_POLL_INTERVAL
+    # seconds. A real alarm here lasted 14 seconds from trigger to silence, so
+    # the normal ~60 s poll would miss the entire event and show only the
+    # aftermath.
+    ALARM_POLL_INTERVAL = 5
+    ALARM_POLL_WINDOW = 600
+    AREA_FLAG_ALARM_SET = [
+        0,   # Alarm
+        1,   # Guard Alarm
+        2,   # Guard Access Alarm
+        3,   # Entry Alarm
+        4,   # Confirmed Alarm
+        5,   # 24hr audible Alarm
+        13,  # Auxiliary Alarm
+        14,  # Tamper Alarm
+        21,  # Armed
+        28,  # Bell SAB
+        29,  # Bell SCB
+        30,  # Strobe
+        36,  # Reset Required
+        44,  # Internal Alarm
+        53,  # Custom Alarm
+        61,  # Intruder Alarm
+        62,  # Speaker Mimic
+    ]
+
+    def start_alarm_flag_polling(self, areanumber):
+        """Begin fast flag polling because an area has entered alarm."""
+        self.alarmPollUntil = time.time() + self.ALARM_POLL_WINDOW
+        self.alarmPollNext = 0
+        self.alarmPollSweepDone = False
+        self.log(
+            "areaFlags: area {:d} in alarm - polling every {:d}s for up to {:d}s".format(
+                areanumber, self.ALARM_POLL_INTERVAL, self.ALARM_POLL_WINDOW
+            )
+        )
+
+    def alarm_flag_set_anywhere(self, bitmaps):
+        """True/False if flag 00 Alarm is set on any area, None if unknown."""
+        if not bitmaps or 0 not in bitmaps:
+            return None
+        bitmap = bitmaps[0][: self.areaBitmapSize]
+        areamask = (1 << self.numberOfAreas) - 1
+        return (int.from_bytes(bitmap, "little") & areamask) != 0
+
+    def service_alarm_flag_polling(self):
+        """One tick of fast polling. Caller guarantees no command is in flight."""
+        self.alarmPollNext = time.time() + self.ALARM_POLL_INTERVAL
+        bitmaps = self.log_all_area_flags(
+            "alarm", self.AREA_FLAG_ALARM_SET, always=True
+        )
+        if not self.alarmPollSweepDone:
+            # One full sweep after the first fast read, to catch anything the
+            # alarm set above does not anticipate. Deliberately second, so the
+            # quick read lands while the alarm is still sounding.
+            self.alarmPollSweepDone = True
+            self.log_all_area_flags(
+                "alarm full sweep", list(range(len(self.AREA_FLAG_NAMES))), always=True
+            )
+        if self.alarm_flag_set_anywhere(bitmaps) is False:
+            self.log("areaFlags: flag 00 Alarm clear on all areas - ending fast poll")
+            self.alarmPollUntil = 0
+
     # The flags worth reading on every poll. The panel refuses a bulk read, so
     # each one costs a round trip - keep this list short.
     #   00 Alarm, 05 24hr audible Alarm, 21 Armed, 36 Reset Required,
@@ -733,7 +800,7 @@ class TexecomConnect(TexecomDefines):
                 )
             )
 
-    def log_all_area_flags(self, reason, flagnums=None):
+    def log_all_area_flags(self, reason, flagnums=None, always=False):
         """Log which area flags the panel holds, for each area.
 
         Diagnostic only: publishes no state and changes no area. It exists
@@ -761,7 +828,7 @@ class TexecomConnect(TexecomDefines):
                 )
             )
         now = time.time()
-        forced = (now - self.lastAreaFlagsLog) > 600
+        forced = always or (now - self.lastAreaFlagsLog) > 600
         for areanumber in range(1, self.numberOfAreas + 1):
             mask = 1 << (areanumber - 1)
             setflags = []
@@ -784,9 +851,9 @@ class TexecomConnect(TexecomDefines):
                     )
                 )
                 self.lastAreaFlags[key] = text
-        if forced:
+        if forced and not always:
             self.lastAreaFlagsLog = now
-        return True
+        return bitmaps
 
     def get_armed_area_state(self):
         # we just track armed state (not part arming or part armed etc)
@@ -931,6 +998,8 @@ class TexecomConnect(TexecomDefines):
             area_state = payload[1]
             area = self.get_area(area_number)
             area.save_state(area_state)
+            if area_state == self.AREA_STATE_INALARM:
+                self.start_alarm_flag_polling(area_number)
             if self.area_event_func is not None:
                 self.area_event_func(area)
             return "Area event: area {:d} {} {}".format(
@@ -1141,6 +1210,16 @@ class TexecomConnect(TexecomDefines):
                 # when no command waiting, drain any arm_disarm_reset queue
                 request = self.arm_disarm_reset_queue.pop(0)
                 self.arm_disarm_reset_area(request[0], request[1], request[2])
+            elif (
+                self.last_command is None
+                and time.time() < self.alarmPollUntil
+                and time.time() >= self.alarmPollNext
+            ):
+                # Fast polling starves the 30 s idle commands for the duration
+                # of the window; that is acceptable because these reads keep the
+                # panel's 60 s timeout fed and zone changes still arrive as
+                # events.
+                self.service_alarm_flag_polling()
             elif time_since_last_command > 30:
                 # get_changed_zones_state and get_armed_area_state to protect against any lost event messages for zone/area status
                 # and to reset the panel's 60 second timeout
