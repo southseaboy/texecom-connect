@@ -63,6 +63,9 @@ class TexecomConnect(TexecomDefines):
         self.numberOfUsers = None
         self.numberOfAreas = None
         self.areaBitmapSize = None
+        # last logged area-flag text per area, and when we last forced a re-log
+        self.lastAreaFlags = {}
+        self.lastAreaFlagsLog = 0
         self.zoneBitmapSize = None
         self.zoneNumSize = None
         self.zones = {}
@@ -608,6 +611,129 @@ class TexecomConnect(TexecomDefines):
                     return None
         return True
 
+    # Area flag names from the Texecom Connect Protocol Payload Specification
+    # Rev N section 4.11.5. The list index IS the flag number used by
+    # CMD_GETAREAFLAGS, so do not reorder it.
+    AREA_FLAG_NAMES = [
+        "Alarm",
+        "Guard Alarm",
+        "Guard Access Alarm",
+        "Entry Alarm",
+        "Confirmed Alarm",
+        "24hr audible Alarm",
+        "24hr Silent Alarm",
+        "24hr Gas Alarm",
+        "PA Alarm",
+        "PA Silent Alarm",
+        "Duress Alarm",
+        "Fire Alarm",
+        "Medical Alarm",
+        "Auxiliary Alarm",
+        "Tamper Alarm",
+        "Abort",
+        "Ready",
+        "Entry",
+        "Second Entry",
+        "Exit",
+        "Entry/Exit",
+        "Armed",
+        "Full Armed",
+        "Part Armed",
+        "Part Arming",
+        "Force Armable",
+        "Force Armed",
+        "Arm Failed",
+        "Bell SAB",
+        "Bell SCB",
+        "Strobe",
+        "Detector Latch",
+        "Detector Reset",
+        "Walk Test",
+        "Omitted",
+        "24hr Omit",
+        "Reset Required",
+        "Door Strike",
+        "Chime Mimic",
+        "Chime Enabled",
+        "Double Knock Active",
+        "Beam Pair",
+        "Zone on test",
+        "Test Failed",
+        "Internal Alarm",
+        "Auto Arming",
+        "Time Arming",
+        "1st Code Entered",
+        "2nd Code Entered",
+        "Area Secured",
+        "Part Arm 1",
+        "Part Arm 2",
+        "Part Arm 3",
+        "Custom Alarm",
+        "Zone Warning",
+        "Arm Fail Warning",
+        "Forced Entry",
+        "Zones Locked Out",
+        "All Armed",
+        "Time Arm Disabled",
+        "Armed/Alarm",
+        "Intruder Alarm",
+        "Speaker Mimic",
+        "Full Armed/Exit",
+        "Detector Fault",
+        "Detector Masked",
+        "Fault Present",
+        "LED control",
+        "Full Armed Entry",
+        "Fire Sounder",
+        "PA Confirmed",
+        "Confirmed Intruder",
+        "Seismic Alarm",
+    ]
+
+    def log_all_area_flags(self, reason):
+        """Read every area flag (0-72) and log which are set, for each area.
+
+        Diagnostic only: this deliberately publishes no state and changes no
+        area. It exists because the panel reports an area entering alarm as an
+        event but never reports it leaving, so we need to see which flags the
+        panel actually holds and when it drops them.
+
+        Logs an area whenever its set of flags changes, and re-logs every area
+        at least every 10 minutes so the poll is visibly alive in the log.
+        """
+        bitmaps = self.get_area_flags(0, len(self.AREA_FLAG_NAMES))
+        if bitmaps is None:
+            # Never fail the caller on this - it is diagnostic, and returning
+            # None into the idle-command check would close the socket.
+            self.log("areaFlags: read failed ({})".format(reason))
+            return None
+        now = time.time()
+        forced = (now - self.lastAreaFlagsLog) > 600
+        for areanumber in range(1, self.numberOfAreas + 1):
+            mask = 1 << (areanumber - 1)
+            setflags = []
+            for flagnum in sorted(bitmaps):
+                # get_area_flags() slices one byte more than areaBitmapSize,
+                # so trim before testing rather than relying on the extra byte
+                # landing above the area bits.
+                bitmap = bitmaps[flagnum][: self.areaBitmapSize]
+                if int.from_bytes(bitmap, "little") & mask:
+                    setflags.append(
+                        "{:d} {}".format(flagnum, self.AREA_FLAG_NAMES[flagnum])
+                    )
+            text = ", ".join(setflags) if setflags else "(none)"
+            if forced or self.lastAreaFlags.get(areanumber) != text:
+                area = self.get_area(areanumber)
+                self.log(
+                    "areaFlags {:d} '{}' [{}]: {}".format(
+                        areanumber, area.text, reason, text
+                    )
+                )
+                self.lastAreaFlags[areanumber] = text
+        if forced:
+            self.lastAreaFlagsLog = now
+        return True
+
     def get_armed_area_state(self):
         # we just track armed state (not part arming or part armed etc)
         outputAreaBitmaps = self.get_area_flags(21, 1)
@@ -909,6 +1035,7 @@ class TexecomConnect(TexecomDefines):
             self.get_site_data()
             self.get_all_zones_state()
             self.get_armed_area_state()
+            self.log_all_area_flags("startup")
             # self.get_system_flags()
             self.log("Got all areas/zones/users; waiting for events")
             while self.s is not None:
@@ -965,6 +1092,8 @@ class TexecomConnect(TexecomDefines):
                     result = self.get_changed_zones_state()
                 else:
                     result = self.get_armed_area_state()
+                    if result is not None:
+                        self.log_all_area_flags("idle")
                 self.lastIdleCommand += 1
                 if self.lastIdleCommand == 2:
                     self.lastIdleCommand = 0
