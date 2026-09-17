@@ -875,10 +875,11 @@ class TexecomConnect(TexecomDefines):
                 self.log("Connection lost")
             connectionLostTime = time.time() - lastConnectedAt
             if connectionLostTime >= 60 and not notifiedConnectionLoss:
-                self.log(
-                    "Connection lost for over 60 seconds - calling send-message.sh"
-                )
-                os.system("./send-message.sh 'connection lost'")
+                # send-message.sh has never existed in the image and
+                # os.system() does not raise, so this notification was dead
+                # code failing silently. Connection loss is now visible in HA
+                # via the availability topic declared in the discovery payload.
+                self.log("Connection lost for over 60 seconds")
                 notifiedConnectionLoss = True
             try:
                 self.connect()
@@ -900,8 +901,7 @@ class TexecomConnect(TexecomDefines):
                 continue
             connected = True
             if notifiedConnectionLoss:
-                self.log("Connection regained - calling send-message.sh")
-                os.system("./send-message.sh 'connection regained'")
+                self.log("Connection regained")
             self.get_number_zones()
             self.get_date_time()
             self.get_system_power()
