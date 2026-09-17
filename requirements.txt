@@ -1,2 +1,2 @@
-crcmod
-paho-mqtt
+crcmod==1.7
+paho-mqtt==2.1.0

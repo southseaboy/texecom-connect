@@ -67,6 +67,17 @@ class TexecomMqtt:
                             tc.requestResetAreas(area_bitmap)
 
     @staticmethod
+    def availability():
+        # Declared to HA so that entities go 'unavailable' if this app or its
+        # link to the panel dies. The topic is published 'online' on every
+        # heartbeat (alive_event) and 'offline' by the MQTT LWT.
+        return {
+            "availability_topic": topic_root + "/alarm_control_panel/state",
+            "payload_available": "online",
+            "payload_not_available": "offline",
+        }
+
+    @staticmethod
     def zone_details_callback(zone, panelType, numberOfZones):
         if zone.zoneType == 1:
             HAZoneType = "door"
@@ -92,6 +103,7 @@ class TexecomMqtt:
                 "model": panelType + " " + str(numberOfZones)
             }
         }
+        message.update(TexecomMqtt.availability())
         if TexecomMqtt.log_mqtt_traffic:
             print("MQTT Update %s: %s" % (configtopic, json.dumps(message)))
         client.publish(configtopic, json.dumps(message), retain=True)
@@ -109,6 +121,15 @@ class TexecomMqtt:
             "state_topic": statetopic,
             "command_topic": commandtopic,
             "unique_id": ".".join([panelType, "area", name]),
+            # No code is configured anywhere in this app; HA defaults
+            # code_arm_required to true, which with code_format null makes
+            # every arm action impossible (demands a code, offers no field).
+            "code_arm_required": False,
+            "code_disarm_required": False,
+            # Advertise only the modes on_message() actually implements.
+            # HA's default is all six, and an unimplemented mode is accepted
+            # by the UI and then silently dropped here - a safety defect.
+            "supported_features": ["arm_home", "arm_away"],
             "device": {
                 "name": "Texecom " + panelType + " " + str(numberOfZones),
                 "identifiers": "123456789",  # TODO panel serial number?
@@ -116,6 +137,7 @@ class TexecomMqtt:
                 "model": panelType + " " + str(numberOfZones)
             }
         }
+        message.update(TexecomMqtt.availability())
         if TexecomMqtt.log_mqtt_traffic:
             print("MQTT Update %s: %s" % (configtopic, json.dumps(message)))
         client.publish(configtopic, json.dumps(message), retain=True)
@@ -137,8 +159,8 @@ class TexecomMqtt:
     def area_status_event(area):
         area_state_str = [
             "disarmed",
-            "pending",
-            "pending",
+            "arming",   # INEXIT  - exit delay running
+            "pending",  # INENTRY - entry delay running
             "armed_away",
             "armed_night",
             "triggered",
@@ -222,11 +244,18 @@ if __name__ == "__main__":
  
     sys.stdout = Unbuffered(sys.stdout)
 
-    client = paho.Client()
+    # paho-mqtt 2.x defaults to the v2 callback API with a deprecation
+    # warning; the callbacks in this file use the v1 signatures, so state
+    # that explicitly rather than relying on the default.
+    client = paho.Client(paho.CallbackAPIVersion.VERSION1)
     client.username_pw_set(broker_user, broker_pass)
     client.on_message = TexecomMqtt.on_message
     client.on_connect = TexecomMqtt.on_connect
-    client.will_set(topic_root + "/alarm_control_panel/state", "offline")
+    # retain=True: paho defaults it to False, so without this a HA restart
+    # while this app is dead would not see the 'offline' LWT.
+    client.will_set(
+        topic_root + "/alarm_control_panel/state", "offline", retain=True
+    )
     print("connecting to broker ", broker_url)
     client.connect(broker_url, broker_port)
     client.loop_start()
