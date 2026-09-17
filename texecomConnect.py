@@ -690,23 +690,76 @@ class TexecomConnect(TexecomDefines):
         "Seismic Alarm",
     ]
 
-    def log_all_area_flags(self, reason):
-        """Read every area flag (0-72) and log which are set, for each area.
+    # The flags worth reading on every poll. The panel refuses a bulk read, so
+    # each one costs a round trip - keep this list short.
+    #   00 Alarm, 05 24hr audible Alarm, 21 Armed, 36 Reset Required,
+    #   61 Intruder Alarm
+    AREA_FLAG_WATCHLIST = [0, 5, 21, 36, 61]
 
-        Diagnostic only: this deliberately publishes no state and changes no
-        area. It exists because the panel reports an area entering alarm as an
-        event but never reports it leaving, so we need to see which flags the
-        panel actually holds and when it drops them.
+    def read_area_flags_individually(self, flagnums):
+        """Read the given area flags one command at a time.
 
-        Logs an area whenever its set of flags changes, and re-logs every area
-        at least every 10 minutes so the poll is visibly alive in the log.
+        `get_area_flags(N, 1)` is the only shape this panel honours. Asking for
+        73 flags in one command returned a single byte and failed the length
+        check ("response wrong length: 1/73") on Elite 48 firmware
+        V4.02.01LS1, so the spec's count field is evidently not implemented as
+        documented. Returns {flagnum: bitmap} for those that read, plus the
+        number that failed.
         """
-        bitmaps = self.get_area_flags(0, len(self.AREA_FLAG_NAMES))
-        if bitmaps is None:
-            # Never fail the caller on this - it is diagnostic, and returning
-            # None into the idle-command check would close the socket.
-            self.log("areaFlags: read failed ({})".format(reason))
+        bitmaps = {}
+        failed = 0
+        for flagnum in flagnums:
+            result = self.get_area_flags(flagnum, 1)
+            if result is None or flagnum not in result:
+                failed += 1
+            else:
+                bitmaps[flagnum] = result[flagnum]
+        return bitmaps, failed
+
+    def probe_area_flag_batching(self):
+        """One-off: log whether the panel honours ANY batched flag read.
+
+        Costs a single command. Purely informational - if a batch of two ever
+        works, the per-poll watchlist could be collapsed into fewer round
+        trips. Nothing depends on the answer.
+        """
+        result = self.get_area_flags(0, 2)
+        if result is None:
+            self.log("areaFlags: batch probe (2 flags) NOT supported")
+        else:
+            self.log(
+                "areaFlags: batch probe (2 flags) returned {:d} bitmaps".format(
+                    len(result)
+                )
+            )
+
+    def log_all_area_flags(self, reason, flagnums=None):
+        """Log which area flags the panel holds, for each area.
+
+        Diagnostic only: publishes no state and changes no area. It exists
+        because the panel reports an area entering alarm as an event but never
+        reports it leaving, so the flags are the only way to see when the panel
+        itself considers the alarm over.
+
+        `flagnums` defaults to the watchlist. The scope is written into every
+        log line, because a line listing only the watchlist must never be read
+        later as though it covered all 73 flags.
+        """
+        if flagnums is None:
+            flagnums = self.AREA_FLAG_WATCHLIST
+        scope = "{:d} flags".format(len(flagnums))
+        bitmaps, failed = self.read_area_flags_individually(flagnums)
+        if not bitmaps:
+            # Never fail the caller on this - returning None into the
+            # idle-command check would close the socket.
+            self.log("areaFlags: read failed entirely ({}, {})".format(reason, scope))
             return None
+        if failed:
+            self.log(
+                "areaFlags: {:d} of {:d} flags failed to read ({})".format(
+                    failed, len(flagnums), reason
+                )
+            )
         now = time.time()
         forced = (now - self.lastAreaFlagsLog) > 600
         for areanumber in range(1, self.numberOfAreas + 1):
@@ -721,15 +774,16 @@ class TexecomConnect(TexecomDefines):
                     setflags.append(
                         "{:d} {}".format(flagnum, self.AREA_FLAG_NAMES[flagnum])
                     )
-            text = ", ".join(setflags) if setflags else "(none)"
-            if forced or self.lastAreaFlags.get(areanumber) != text:
+            text = ", ".join(setflags) if setflags else "(none set)"
+            key = (scope, areanumber)
+            if forced or self.lastAreaFlags.get(key) != text:
                 area = self.get_area(areanumber)
                 self.log(
-                    "areaFlags {:d} '{}' [{}]: {}".format(
-                        areanumber, area.text, reason, text
+                    "areaFlags {:d} '{}' [{}, of {}]: {}".format(
+                        areanumber, area.text, reason, scope, text
                     )
                 )
-                self.lastAreaFlags[areanumber] = text
+                self.lastAreaFlags[key] = text
         if forced:
             self.lastAreaFlagsLog = now
         return True
@@ -1035,7 +1089,11 @@ class TexecomConnect(TexecomDefines):
             self.get_site_data()
             self.get_all_zones_state()
             self.get_armed_area_state()
-            self.log_all_area_flags("startup")
+            self.probe_area_flag_batching()
+            # one-off full sweep: every flag, one command each (~20 s)
+            self.log_all_area_flags(
+                "startup sweep", list(range(len(self.AREA_FLAG_NAMES)))
+            )
             # self.get_system_flags()
             self.log("Got all areas/zones/users; waiting for events")
             while self.s is not None:
