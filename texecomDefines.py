@@ -40,6 +40,13 @@ class TexecomDefines:
     CMD_SETDATETIME = bytes([24])
     CMD_GETSYSTEMPOWER = bytes([25])
     CMD_GETUSER = bytes([27])
+    # Arm/Disarm as User carry a user number and nothing else - no area
+    # bitmap and no arm type. The panel decides which areas and whether the
+    # arm is full or part from that user's own programming, and it applies
+    # that user's rights (proven 2026-09-18: an "Arm Only" user armed but
+    # could not disarm). Neither may be used with user 0, the engineer.
+    CMD_ARMAREASASUSER = bytes([29])
+    CMD_DISARMAREASASUSER = bytes([30])
     CMD_GETAREADETAILS = bytes([35])
     CMD_GETZONECHANGES = bytes([36])
     CMD_SETEVENTMESSAGES = bytes([37])

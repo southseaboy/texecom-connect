@@ -21,6 +21,7 @@
 import os
 import sys
 import json
+import time
 import atexit
 
 from texecomConnect import TexecomConnect
@@ -37,34 +38,120 @@ class TexecomMqtt:
         if len(topic_subs[0]) > 0:
             client.subscribe(topic_root + "/alarm_control_panel/+/command/#")
 
+    # A command is only acted on if it carries the code of a user programmed
+    # in the panel. Rejections are counted across the whole route rather than
+    # per user - a wrong code matches nobody, so there is no-one to count it
+    # against. The keypad is never affected by a lockout here.
+    LOCKOUT_AFTER = 5
+    LOCKOUT_SECONDS = 15 * 60
+    failed_attempts = 0
+    locked_until = 0.0
+
+    @staticmethod
+    def parse_command(payload):
+        """Return (action, code) from a command payload, or (None, None).
+
+        The returned code is for matching only and must never be logged,
+        published or included in an error message.
+        """
+        try:
+            text = payload.decode("utf-8")
+        except (UnicodeDecodeError, AttributeError):
+            return (None, None)
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return (None, None)
+        if not isinstance(parsed, dict):
+            return (None, None)
+        action, code = parsed.get("action"), parsed.get("code")
+        if not isinstance(action, str) or not isinstance(code, str):
+            return (None, None)
+        return (action, code)
+
+    @staticmethod
+    def reject(reason):
+        """Count a rejected command and lock the route out on the fifth."""
+        TexecomMqtt.failed_attempts += 1
+        if TexecomMqtt.failed_attempts >= TexecomMqtt.LOCKOUT_AFTER:
+            TexecomMqtt.locked_until = time.time() + TexecomMqtt.LOCKOUT_SECONDS
+            TexecomMqtt.failed_attempts = 0
+            print("command rejected ({}): {:d} failures, locking the Home Assistant "
+                  "route for {:d} minutes - the keypad is unaffected".format(
+                      reason, TexecomMqtt.LOCKOUT_AFTER,
+                      TexecomMqtt.LOCKOUT_SECONDS // 60))
+        else:
+            print("command rejected ({}): {:d} more before a {:d} minute lockout".format(
+                reason, TexecomMqtt.LOCKOUT_AFTER - TexecomMqtt.failed_attempts,
+                TexecomMqtt.LOCKOUT_SECONDS // 60))
+
     @staticmethod
     def on_message(client, userdata, message):
-        # Arm/Disarm/Reset
-        # To give a level of security its advisable to limit access to the subscribe topic on the mqtt broker
+        # Arm/Disarm/Reset. Every command must carry a code belonging to a
+        # user programmed in the panel; the command is then sent AS that user,
+        # so the panel's own log names them and the panel applies their rights.
         topic = message.topic
-        if TexecomMqtt.log_mqtt_traffic:
-            print(
-                "topic: " + topic + " received message =",
-                str(message.payload.decode("utf-8")),
-            )
         topicbase = topic_root + "/alarm_control_panel/"
-        if len(topic) > len(topicbase):
-            idx = topic.find("/", len(topicbase))
-            if idx >= 0:
-                subtopic = topic[len(topicbase) : idx]
-                if subtopic in topic_subs:
-                    subtopicIdx = topic_subs.index(subtopic)
-                    if len(topic_areamaps) >= subtopicIdx:
-                        areamap = topic_areamaps[subtopicIdx]
-                        area_bitmap = bytes.fromhex(areamap)
-                        if message.payload.decode("utf-8") == "ARM_AWAY":
-                            tc.requestArmAreas(area_bitmap)
-                        elif message.payload.decode("utf-8") == "ARM_HOME":
-                            tc.requestPartArmAreas(area_bitmap)
-                        elif message.payload.decode("utf-8") == "DISARM":
-                            tc.requestDisArmAreas(area_bitmap)
-                        elif message.payload.decode("utf-8") == "reset":
-                            tc.requestResetAreas(area_bitmap)
+        if len(topic) <= len(topicbase):
+            return
+        idx = topic.find("/", len(topicbase))
+        if idx < 0:
+            return
+        subtopic = topic[len(topicbase) : idx]
+        if subtopic not in topic_subs:
+            return
+        subtopicIdx = topic_subs.index(subtopic)
+        if len(topic_areamaps) < subtopicIdx:
+            return
+        area_bitmap = bytes.fromhex(topic_areamaps[subtopicIdx])
+
+        # NB: the payload carries the code, so it is never printed - only the
+        # action is, and only when traffic logging is on.
+        action, code = TexecomMqtt.parse_command(message.payload)
+        if TexecomMqtt.log_mqtt_traffic:
+            print("topic: {} action: {}".format(topic, action or "(unparsable)"))
+
+        now = time.time()
+        if now < TexecomMqtt.locked_until:
+            print("command refused: locked out for another {:d}s".format(
+                int(TexecomMqtt.locked_until - now)))
+            return
+        if action is None or not code:
+            # A bare string such as "DISARM" - the old behaviour, and anything
+            # else publishing to this topic - lands here. It carries no code,
+            # so it is refused: broker access alone no longer arms or disarms.
+            TexecomMqtt.reject("payload carried no action and code")
+            return
+
+        status, usernumber, username = tc.find_user_by_code(code)
+        if status == "ambiguous":
+            TexecomMqtt.reject("code matches more than one user")
+            return
+        if status != "match":
+            TexecomMqtt.reject("code did not match any user")
+            return
+        TexecomMqtt.failed_attempts = 0
+
+        # The matched user IS logged: that is the audit trail this design
+        # exists to produce. The code never is.
+        if action == "ARM_AWAY":
+            print("ARM_AWAY accepted for user {:d} '{}'".format(usernumber, username))
+            tc.requestArmAreasAsUser(usernumber)
+        elif action == "DISARM":
+            print("DISARM accepted for user {:d} '{}'".format(usernumber, username))
+            tc.requestDisArmAreasAsUser(usernumber)
+        elif action == "reset":
+            # The protocol has no reset-as-user, so this one is code-gated
+            # here but anonymous in the panel's own log.
+            print("reset accepted for user {:d} '{}' (anonymous at the panel)".format(
+                usernumber, username))
+            tc.requestResetAreas(area_bitmap)
+        else:
+            # Never drop an unknown action silently: a user could otherwise
+            # press a mode, watch HA accept it, and leave believing the house
+            # is armed when nothing was sent anywhere.
+            print("action '{}' is not implemented - ignored (user {:d} '{}')".format(
+                action, usernumber, username))
 
     @staticmethod
     def availability():
@@ -121,15 +208,24 @@ class TexecomMqtt:
             "state_topic": statetopic,
             "command_topic": commandtopic,
             "unique_id": ".".join([panelType, "area", name]),
-            # No code is configured anywhere in this app; HA defaults
-            # code_arm_required to true, which with code_format null makes
-            # every arm action impossible (demands a code, offers no field).
-            "code_arm_required": False,
-            "code_disarm_required": False,
+            # Every command must carry a panel user's code. REMOTE_CODE tells
+            # HA to skip its own validation and pass the typed code through to
+            # us; code_format gives the numeric keypad, without which HA
+            # offers nowhere to type it. No PIN is stored in Home Assistant.
+            "code": "REMOTE_CODE",
+            "code_format": "^\\d{4}$",
+            "code_arm_required": True,
+            "code_disarm_required": True,
+            "command_template": '{"action":"{{ action }}","code":"{{ code }}"}',
             # Advertise only the modes on_message() actually implements.
             # HA's default is all six, and an unimplemented mode is accepted
             # by the UI and then silently dropped here - a safety defect.
-            "supported_features": ["arm_home", "arm_away"],
+            # Part arm is NOT offered: Cmd 29 cannot express it, so a Home
+            # button could only arm anonymously or under-arm the house.
+            # NB: supported_features applies at entity SETUP, not on a
+            # discovery update - the MQTT integration must be reloaded once
+            # after this is first published or the entity keeps its old set.
+            "supported_features": ["arm_away"],
             "device": {
                 "name": "Texecom " + panelType + " " + str(numberOfZones),
                 "identifiers": "123456789",  # TODO panel serial number?

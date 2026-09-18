@@ -76,6 +76,11 @@ class TexecomConnect(TexecomDefines):
         self.users = {}
         self.areas = {}
         self.arm_disarm_reset_queue = []
+        # Backstop re-read of the user table. A code changed or deleted at the
+        # keypad must stop working through Home Assistant without waiting for
+        # a restart; the Site Data Changed log event covers the normal case
+        # and this covers anything the panel does not announce.
+        self.next_user_refresh = time.time() + self.USER_REFRESH_SECS
         self.requestPanelOutputEvents = True
         self.s = None
         # used to record which of our idle commands we last sent to the panel
@@ -164,6 +169,76 @@ class TexecomConnect(TexecomDefines):
             if self.zone_details_func is not None:
                 self.zone_details_func(zone, self.panelType, self.numberOfZones)
         return zone
+
+    USER_REFRESH_SECS = 24 * 60 * 60
+
+    def arm_disarm_as_user(self, cmd, usernumber):
+        """CMD_ARMAREASASUSER, CMD_DISARMAREASASUSER
+
+        The command carries a user number and nothing else: the panel decides
+        which areas and whether the arm is full or part, and it applies that
+        user's own rights.
+
+        The panel ACKs a command it then refuses to action - proven on this
+        system 2026-09-18, when an "Arm Only" user's disarm was ACKed and the
+        area stayed Full Armed with no log event for the refusal. An ACK here
+        therefore means the frame was accepted, NOT that the panel did it.
+        The only evidence of the outcome is the area state, which lags by
+        several seconds.
+        """
+        if usernumber == 0:
+            self.log("refusing to send as user 0: the protocol forbids it")
+            return False
+        if cmd == self.CMD_ARMAREASASUSER:
+            cmdText = "arm as user"
+        elif cmd == self.CMD_DISARMAREASASUSER:
+            cmdText = "disarm as user"
+        else:
+            self.log("unexpected cmd for arm_disarm_as_user: 0x" + cmd.hex())
+            return False
+        response = self.sendcommand(cmd, bytes([usernumber]))
+        if response is None:
+            self.log("cmd {} {:d}: no response from panel".format(cmdText, usernumber))
+            return False
+        if response == self.CMD_RESPONSE_NAK:
+            self.log("cmd {} {:d}: NAK - panel refused the command".format(cmdText, usernumber))
+            return False
+        if response != self.CMD_RESPONSE_ACK:
+            self.log("cmd {} {:d}: unexpected response 0x{}".format(
+                cmdText, usernumber, response.hex()))
+            return False
+        self.log("cmd {} {:d}: accepted by the panel (an ACK is not proof it was actioned)".format(
+            cmdText, usernumber))
+        return True
+
+    def find_user_by_code(self, code):
+        """Match a code typed in Home Assistant against the panel's user table.
+
+        Returns (status, usernumber, name); status is "match", "none" or
+        "ambiguous". The code itself is never logged, published or returned.
+
+        The panel enforces what each user may actually do, so a match here is
+        permission to *send* the command, not permission to arm or disarm -
+        a user without disarm rights is refused by the panel.
+        """
+        if not code or not code.isdigit():
+            return ("none", None, None)
+        matches = []
+        for usernumber, user in list(self.users.items()):
+            # user 0 is the synthesised Engineer entry: it has no code, and
+            # the protocol forbids arming or disarming as user 0
+            if usernumber == 0:
+                continue
+            stored = user.passcode
+            if not stored:
+                continue
+            if len(stored) == len(code) and stored == code:
+                matches.append((usernumber, user.name))
+        if len(matches) == 1:
+            return ("match", matches[0][0], matches[0][1])
+        if len(matches) > 1:
+            return ("ambiguous", None, None)
+        return ("none", None, None)
 
     def arm_disarm_reset_area(self, cmd, arm_type, area_bitmap):
         """CMD_ARMAREAS, CMD_DISARMAREAS, CMD_RESETAREAS"""
@@ -567,14 +642,36 @@ class TexecomConnect(TexecomDefines):
                 self.associateZoneWithAreas(zone)
 
     def get_all_users(self):
-        if self.numberOfUsers is not None:
-            for usernumber in range(1, self.numberOfUsers):
-                user = self.get_user(usernumber)
-                if user.valid():
-                    self.users[usernumber] = user
-            user = User()
-            user.name = "Engineer"
-            self.users[0] = user
+        """Read the whole user table and swap it in atomically.
+
+        Slot numbering, verified on this panel 2026-09-18: an UNPROGRAMMED
+        slot returns a full 23-byte record with an empty code (so it is simply
+        skipped), but slot `numberOfUsers` itself NAKs and makes get_user
+        return None. The range below is therefore correct as written - do not
+        "fix" it to numberOfUsers + 1, which would crash on every read.
+        """
+        if self.numberOfUsers is None:
+            return
+        users = {}
+        for usernumber in range(1, self.numberOfUsers):
+            user = self.get_user(usernumber)
+            if user is not None and user.valid():
+                users[usernumber] = user
+        if not users and self.users:
+            # A failed refresh must never empty the table: an empty table
+            # matches no code and would silently disable arm and disarm from
+            # Home Assistant until the next restart.
+            self.log("user table refresh returned nothing; keeping the previous {:d} entries".format(
+                len(self.users)))
+            return
+        engineer = User()
+        engineer.name = "Engineer"
+        users[0] = engineer
+        # rebind rather than mutate: on_message reads this from the MQTT thread
+        self.users = users
+        self.next_user_refresh = time.time() + self.USER_REFRESH_SECS
+        withcode = len([u for n, u in users.items() if n != 0 and u.passcode])
+        self.log("user table loaded: {:d} users with a code".format(withcode))
 
     def get_all_areas(self):
         for areanumber in range(1, self.numberOfAreas + 1):
@@ -944,21 +1041,31 @@ class TexecomConnect(TexecomDefines):
     def enable_output_events(self, yes):
         self.requestPanelOutputEvents = (yes == True)
 
+    # Queue entries are tagged with their kind: "areas" commands carry an
+    # area bitmap, "user" commands carry a user number and nothing else.
     def requestArmAreas(self, area_bitmap):
         """Queue arm areas request. Request is queued for processing by main thread"""
-        self.arm_disarm_reset_queue.append((self.CMD_ARMAREAS, self.ARMING_TYPE_FULL, area_bitmap))
+        self.arm_disarm_reset_queue.append(("areas", self.CMD_ARMAREAS, self.ARMING_TYPE_FULL, area_bitmap))
 
     def requestPartArmAreas(self, area_bitmap):
         """Queue part arm areas request. Request is queued for processing by main thread"""
-        self.arm_disarm_reset_queue.append((self.CMD_ARMAREAS, self.ARMING_TYPE_PART1, area_bitmap))
+        self.arm_disarm_reset_queue.append(("areas", self.CMD_ARMAREAS, self.ARMING_TYPE_PART1, area_bitmap))
 
     def requestDisArmAreas(self, area_bitmap):
         """Queue disarm areas request. Request is queued for processing by main thread"""
-        self.arm_disarm_reset_queue.append((self.CMD_DISARMAREAS, None, area_bitmap))
+        self.arm_disarm_reset_queue.append(("areas", self.CMD_DISARMAREAS, None, area_bitmap))
 
     def requestResetAreas(self, area_bitmap):
         """Queue reset areas request. Request is queued for processing by main thread"""
-        self.arm_disarm_reset_queue.append((self.CMD_RESETAREAS, None, area_bitmap))
+        self.arm_disarm_reset_queue.append(("areas", self.CMD_RESETAREAS, None, area_bitmap))
+
+    def requestArmAreasAsUser(self, usernumber):
+        """Queue arm-as-user request. Request is queued for processing by main thread"""
+        self.arm_disarm_reset_queue.append(("user", self.CMD_ARMAREASASUSER, usernumber, None))
+
+    def requestDisArmAreasAsUser(self, usernumber):
+        """Queue disarm-as-user request. Request is queued for processing by main thread"""
+        self.arm_disarm_reset_queue.append(("user", self.CMD_DISARMAREASASUSER, usernumber, None))
 
     def set_area_state(self, area, area_state):
         area.state = area_state
@@ -1082,6 +1189,11 @@ class TexecomConnect(TexecomDefines):
             timestamp_str = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
                 year, month, day, hours, minutes, seconds
             )
+            if event_type == 100:
+                # Site Data Changed: something was reprogrammed, at the keypad
+                # or in Wintex. Re-read the site data so a changed or deleted
+                # user code stops working without waiting for a restart.
+                self.siteDataChanged = True
             if event_type in self.log_event_types:
                 event_str = self.log_event_types[event_type]
             else:
@@ -1209,7 +1321,10 @@ class TexecomConnect(TexecomDefines):
             if self.last_command is None and len(self.arm_disarm_reset_queue) > 0:
                 # when no command waiting, drain any arm_disarm_reset queue
                 request = self.arm_disarm_reset_queue.pop(0)
-                self.arm_disarm_reset_area(request[0], request[1], request[2])
+                if request[0] == "user":
+                    self.arm_disarm_as_user(request[1], request[2])
+                else:
+                    self.arm_disarm_reset_area(request[1], request[2], request[3])
             elif (
                 self.last_command is None
                 and time.time() < self.alarmPollUntil
@@ -1238,6 +1353,12 @@ class TexecomConnect(TexecomDefines):
                     self.log("idle command failed; closing socket")
                     self.closesocket()
                     return None
+                if time.time() >= self.next_user_refresh:
+                    # Backstop for anything the panel does not announce as a
+                    # Site Data Changed event. The main loop does the work.
+                    self.next_user_refresh = time.time() + self.USER_REFRESH_SECS
+                    self.log("daily user table refresh due")
+                    self.siteDataChanged = True
             if time.time() - self.time_last_heartbeat > self.alive_heartbeat_secs:
                 self.alive()
             #header = self.s.recv(self.LENGTH_HEADER)
