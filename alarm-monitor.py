@@ -210,10 +210,11 @@ class TexecomMqtt:
             "unique_id": ".".join([panelType, "area", name]),
             # Every command must carry a panel user's code. REMOTE_CODE tells
             # HA to skip its own validation and pass the typed code through to
-            # us; code_format gives the numeric keypad, without which HA
-            # offers nowhere to type it. No PIN is stored in Home Assistant.
+            # us, and by itself makes the frontend show a numeric keypad.
+            # No PIN is stored in Home Assistant.
+            # NB: code_format is NOT a key of the MQTT alarm panel schema -
+            # adding it risks HA rejecting this whole discovery config.
             "code": "REMOTE_CODE",
-            "code_format": "^\\d{4}$",
             "code_arm_required": True,
             "code_disarm_required": True,
             "command_template": '{"action":"{{ action }}","code":"{{ code }}"}',

@@ -252,8 +252,8 @@ check("a code is required to arm and to disarm",
       cfg["code_arm_required"] is True and cfg["code_disarm_required"] is True)
 check("HA is told to hand the code to us rather than check it itself",
       cfg["code"] == "REMOTE_CODE")
-check("the code format asks for 4 digits",
-      cfg["code_format"] == r"^\d{4}$")
+check("no code_format key - it is not in the MQTT alarm panel schema",
+      "code_format" not in cfg)
 check("the command template sends action and code as JSON",
       cfg["command_template"] == '{"action":"{{ action }}","code":"{{ code }}"}')
 check("availability is still declared",
