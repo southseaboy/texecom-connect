@@ -70,18 +70,35 @@ class TexecomMqtt:
         return (action, code)
 
     @staticmethod
+    def audit(message):
+        """Record a command decision - timestamped, and published to the log topic.
+
+        A bare print() carries no time, which is indefensible on the one line
+        that IS the audit trail. These lines carry the action, the outcome
+        and, on a match, the user's number and name - never a code.
+        """
+        logger = globals().get("tc")
+        if logger is None:
+            # The MQTT loop is started before tc exists. Nothing can be
+            # matched against the panel that early, but the line must not be
+            # silently lost either.
+            print(message)
+            return
+        logger.log(message)
+
+    @staticmethod
     def reject(reason):
         """Count a rejected command and lock the route out on the fifth."""
         TexecomMqtt.failed_attempts += 1
         if TexecomMqtt.failed_attempts >= TexecomMqtt.LOCKOUT_AFTER:
             TexecomMqtt.locked_until = time.time() + TexecomMqtt.LOCKOUT_SECONDS
             TexecomMqtt.failed_attempts = 0
-            print("command rejected ({}): {:d} failures, locking the Home Assistant "
+            TexecomMqtt.audit("command rejected ({}): {:d} failures, locking the Home Assistant "
                   "route for {:d} minutes - the keypad is unaffected".format(
                       reason, TexecomMqtt.LOCKOUT_AFTER,
                       TexecomMqtt.LOCKOUT_SECONDS // 60))
         else:
-            print("command rejected ({}): {:d} more before a {:d} minute lockout".format(
+            TexecomMqtt.audit("command rejected ({}): {:d} more before a {:d} minute lockout".format(
                 reason, TexecomMqtt.LOCKOUT_AFTER - TexecomMqtt.failed_attempts,
                 TexecomMqtt.LOCKOUT_SECONDS // 60))
 
@@ -113,7 +130,7 @@ class TexecomMqtt:
 
         now = time.time()
         if now < TexecomMqtt.locked_until:
-            print("command refused: locked out for another {:d}s".format(
+            TexecomMqtt.audit("command refused: locked out for another {:d}s".format(
                 int(TexecomMqtt.locked_until - now)))
             return
         if action is None or not code:
@@ -135,22 +152,22 @@ class TexecomMqtt:
         # The matched user IS logged: that is the audit trail this design
         # exists to produce. The code never is.
         if action == "ARM_AWAY":
-            print("ARM_AWAY accepted for user {:d} '{}'".format(usernumber, username))
+            TexecomMqtt.audit("ARM_AWAY accepted for user {:d} '{}'".format(usernumber, username))
             tc.requestArmAreasAsUser(usernumber)
         elif action == "DISARM":
-            print("DISARM accepted for user {:d} '{}'".format(usernumber, username))
+            TexecomMqtt.audit("DISARM accepted for user {:d} '{}'".format(usernumber, username))
             tc.requestDisArmAreasAsUser(usernumber)
         elif action == "reset":
             # The protocol has no reset-as-user, so this one is code-gated
             # here but anonymous in the panel's own log.
-            print("reset accepted for user {:d} '{}' (anonymous at the panel)".format(
+            TexecomMqtt.audit("reset accepted for user {:d} '{}' (anonymous at the panel)".format(
                 usernumber, username))
             tc.requestResetAreas(area_bitmap)
         else:
             # Never drop an unknown action silently: a user could otherwise
             # press a mode, watch HA accept it, and leave believing the house
             # is armed when nothing was sent anywhere.
-            print("action '{}' is not implemented - ignored (user {:d} '{}')".format(
+            TexecomMqtt.audit("action '{}' is not implemented - ignored (user {:d} '{}')".format(
                 action, usernumber, username))
 
     @staticmethod
@@ -226,7 +243,15 @@ class TexecomMqtt:
             # NB: supported_features applies at entity SETUP, not on a
             # discovery update - the MQTT integration must be reloaded once
             # after this is first published or the entity keeps its old set.
-            "supported_features": ["arm_away"],
+            # Vacation is BORROWED as the panel-reset button: it publishes
+            # "reset", which on_message() already implements, and it inherits
+            # code_arm_required, so the reset is code-gated exactly like an
+            # arm. The panel has no vacation mode and never reports one, so
+            # the entity can never sit in armed_vacation and the button stays
+            # pressable. NB: any caller of alarm_arm_vacation - including
+            # Developer Tools - therefore resets the panel.
+            "payload_arm_vacation": "reset",
+            "supported_features": ["arm_away", "arm_vacation"],
             "device": {
                 "name": "Texecom " + panelType + " " + str(numberOfZones),
                 "identifiers": "123456789",  # TODO panel serial number?
@@ -271,6 +296,56 @@ class TexecomMqtt:
         if TexecomMqtt.log_mqtt_traffic:
             print("MQTT Update %s: %s" % (topic, area_state_str))
         client.publish(topic, area_state_str, retain=True)
+
+    # Area flags published as their own binary sensor: {flag: (slug, class)}.
+    AREA_FLAG_SENSORS = {
+        36: ("reset_required", "problem"),
+    }
+    # Discovery configs already published this run, so that the state publish
+    # on every poll does not republish them every 60 seconds.
+    flag_sensors_announced = set()
+
+    @staticmethod
+    def area_flags_callback(area, flagnum, isset):
+        """Publish one area flag. Called on every flag poll, per area."""
+        if flagnum not in TexecomMqtt.AREA_FLAG_SENSORS:
+            return
+        slug, device_class = TexecomMqtt.AREA_FLAG_SENSORS[flagnum]
+        areaname = str.lower((area.text).replace(" ", "_"))
+        name = slug + "_" + areaname
+        topicbase = topic_root + "/binary_sensor/" + name
+        statetopic = topicbase + "/state"
+        if name not in TexecomMqtt.flag_sensors_announced:
+            configtopic = config_root + "/binary_sensor/" + name + "/config"
+            message = {
+                "name": "Reset required " + area.text,
+                "device_class": device_class,
+                "state_topic": statetopic,
+                "payload_on": "True",
+                "payload_off": "False",
+                # Only the areas Home Assistant can actually command are
+                # enabled. The rest register disabled: they hold no state and
+                # write no history until switched on by hand in the UI, which
+                # needs no rebuild.
+                "enabled_by_default": areaname in topic_subs,
+                "unique_id": ".".join(
+                    [tc.panelType, "areaflag", str(flagnum), areaname]
+                ),
+                "device": {
+                    "name": "Texecom " + tc.panelType + " " + str(tc.numberOfZones),
+                    "identifiers": "123456789",
+                    "manufacturer": "Texecom",
+                    "model": tc.panelType + " " + str(tc.numberOfZones)
+                }
+            }
+            message.update(TexecomMqtt.availability())
+            if TexecomMqtt.log_mqtt_traffic:
+                print("MQTT Update %s: %s" % (configtopic, json.dumps(message)))
+            client.publish(configtopic, json.dumps(message), retain=True)
+            TexecomMqtt.flag_sensors_announced.add(name)
+        if TexecomMqtt.log_mqtt_traffic:
+            print("MQTT Update %s: %s" % (statetopic, isset))
+        client.publish(statetopic, str(isset), retain=True)
 
     @staticmethod
     def alive_event():
@@ -365,6 +440,7 @@ if __name__ == "__main__":
     tc.on_area_details(TexecomMqtt.area_details_callback)
     tc.on_zone_details(TexecomMqtt.zone_details_callback)
     tc.on_log_event(TexecomMqtt.log_event)
+    tc.on_area_flags(TexecomMqtt.area_flags_callback)
 
     atexit.register(TexecomMqtt.exiting)
 

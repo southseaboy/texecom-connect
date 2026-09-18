@@ -58,6 +58,7 @@ class TexecomConnect(TexecomDefines):
         self.zone_details_func = None
         self.zone_event_func = None
         self.log_event_func = None
+        self.area_flags_func = None
         self.numberOfZones = None
         self.highestUsedZone = None
         self.numberOfUsers = None
@@ -70,6 +71,8 @@ class TexecomConnect(TexecomDefines):
         self.alarmPollUntil = 0
         self.alarmPollNext = 0
         self.alarmPollSweepDone = False
+        # timestamps at which to re-read the area flags after a reset
+        self.flagReadBackDue = []
         self.zoneBitmapSize = None
         self.zoneNumSize = None
         self.zones = {}
@@ -273,6 +276,7 @@ class TexecomConnect(TexecomDefines):
             cmdText = "disarm"
         elif cmd == self.CMD_RESETAREAS:
             cmdText = "reset"
+            self.schedule_flag_readback()
         else:
             cmdText = "unknown"
         self.log(
@@ -854,6 +858,42 @@ class TexecomConnect(TexecomDefines):
             self.log("areaFlags: flag 00 Alarm clear on all areas - ending fast poll")
             self.alarmPollUntil = 0
 
+    # Area flags published to Home Assistant as their own binary sensor.
+    # Flag 36 is the panel's own "this area still needs a reset" state, and it
+    # is the only evidence available that a reset did anything: the panel
+    # reports no event when the condition clears (proven 2026-09-17).
+    AREA_FLAGS_PUBLISHED = [36]
+
+    # After a reset, re-read the flags rather than waiting up to a minute for
+    # the idle poll. A reset that clears nothing is itself the finding, so it
+    # must be visible promptly.
+    FLAG_READBACK_DELAYS = [5, 15]
+
+    def schedule_flag_readback(self):
+        """Queue flag re-reads after a command that should change them."""
+        now = time.time()
+        self.flagReadBackDue = [now + delay for delay in self.FLAG_READBACK_DELAYS]
+
+    def publish_area_flags(self, bitmaps):
+        """Hand the published flags to the MQTT layer, one area at a time.
+
+        A flag that failed to read is skipped entirely: leaving the last
+        published value in place is right, whereas publishing a false 'clear'
+        would say the panel is happy when we simply could not ask it.
+        """
+        if self.area_flags_func is None or not bitmaps:
+            return
+        for flagnum in self.AREA_FLAGS_PUBLISHED:
+            if flagnum not in bitmaps:
+                continue
+            bitmap = bitmaps[flagnum][: self.areaBitmapSize]
+            value = int.from_bytes(bitmap, "little")
+            for areanumber in range(1, self.numberOfAreas + 1):
+                area = self.get_area(areanumber)
+                self.area_flags_func(
+                    area, flagnum, bool(value & (1 << (areanumber - 1)))
+                )
+
     # The flags worth reading on every poll. The panel refuses a bulk read, so
     # each one costs a round trip - keep this list short.
     #   00 Alarm, 05 24hr audible Alarm, 21 Armed, 36 Reset Required,
@@ -950,6 +990,7 @@ class TexecomConnect(TexecomDefines):
                 self.lastAreaFlags[key] = text
         if forced and not always:
             self.lastAreaFlagsLog = now
+        self.publish_area_flags(bitmaps)
         return bitmaps
 
     def get_armed_area_state(self):
@@ -1037,6 +1078,9 @@ class TexecomConnect(TexecomDefines):
 
     def on_log_event(self, log_event_func):
         self.log_event_func = log_event_func
+
+    def on_area_flags(self, area_flags_func):
+        self.area_flags_func = area_flags_func
 
     def enable_output_events(self, yes):
         self.requestPanelOutputEvents = (yes == True)
@@ -1325,6 +1369,13 @@ class TexecomConnect(TexecomDefines):
                     self.arm_disarm_as_user(request[1], request[2])
                 else:
                     self.arm_disarm_reset_area(request[1], request[2], request[3])
+            elif (
+                self.last_command is None
+                and self.flagReadBackDue
+                and time.time() >= self.flagReadBackDue[0]
+            ):
+                self.flagReadBackDue.pop(0)
+                self.log_all_area_flags("after reset", always=True)
             elif (
                 self.last_command is None
                 and time.time() < self.alarmPollUntil

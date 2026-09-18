@@ -236,7 +236,11 @@ published = {}
 class FakeClient:
     @staticmethod
     def publish(topic, payload, retain=False):
-        published[topic] = json.loads(payload)
+        try:
+            published[topic] = json.loads(payload)
+        except (ValueError, TypeError):
+            # state topics carry a bare string, not JSON
+            published[topic] = payload
 
 
 class FakeArea:
@@ -246,8 +250,13 @@ class FakeArea:
 mon.client = FakeClient
 mon.TexecomMqtt.area_details_callback(FakeArea(), "Elite", 48)
 cfg = published["homeassistant/alarm_control_panel/intruder/config"]
-check("the entity offers Away only - no part arm button",
-      cfg["supported_features"] == ["arm_away"])
+check("the entity offers Away plus the borrowed vacation button",
+      cfg["supported_features"] == ["arm_away", "arm_vacation"])
+check("vacation publishes 'reset', which on_message already implements",
+      cfg["payload_arm_vacation"] == "reset")
+check("no part arm button is offered",
+      "arm_home" not in cfg["supported_features"] and
+      "arm_night" not in cfg["supported_features"])
 check("a code is required to arm and to disarm",
       cfg["code_arm_required"] is True and cfg["code_disarm_required"] is True)
 check("HA is told to hand the code to us rather than check it itself",
@@ -258,6 +267,131 @@ check("the command template sends action and code as JSON",
       cfg["command_template"] == '{"action":"{{ action }}","code":"{{ code }}"}')
 check("availability is still declared",
       cfg["availability_topic"] == "homeassistant/alarm_control_panel/state")
+
+# ------------------------------------------------- area flags -> HA sensors
+def flag_tc(areas=4):
+    f = make_tc({})
+    f.numberOfAreas = areas
+    f.areaBitmapSize = 7
+    f.panelType = "Elite"
+    f.numberOfZones = 48
+    for n in range(1, areas + 1):
+        f.get_area(n).text = {1: "intruder", 2: "fire_co_alarms"}.get(
+            n, "area{:d}".format(n))
+    return f
+
+
+def bitmap(areamask):
+    return areamask.to_bytes(8, "little")     # one byte longer, as the panel sends
+
+
+seen = []
+f = flag_tc()
+f.on_area_flags(lambda area, flagnum, isset: seen.append(
+    (area.number, flagnum, isset)))
+
+f.publish_area_flags({36: bitmap(0b0001)})
+check("flag 36 set on area 1 only publishes True for area 1",
+      seen == [(1, 36, True), (2, 36, False), (3, 36, False), (4, 36, False)])
+
+seen[:] = []
+f.publish_area_flags({36: bitmap(0b1010)})
+check("the per-area bit is read, not just 'anything set'",
+      [s for s in seen if s[2]] == [(2, 36, True), (4, 36, True)])
+
+seen[:] = []
+f.publish_area_flags({0: bitmap(0b1111), 21: bitmap(0b1111)})
+check("a read that did not include flag 36 publishes nothing at all",
+      seen == [])
+
+seen[:] = []
+f.publish_area_flags({})
+check("an empty read publishes nothing rather than a false clear",
+      seen == [])
+
+seen[:] = []
+f.publish_area_flags({36: bitmap(0b1111)})
+check("the extra byte the panel returns does not bleed into the area bits",
+      len([s for s in seen if s[2]]) == 4)
+
+quiet = flag_tc()
+quiet.publish_area_flags({36: bitmap(0b0001)})
+check("publishing with no callback registered is a no-op, not a crash", True)
+
+# ------------------------------------------------ the read-back after a reset
+rb = make_tc({})
+check("no flag read-back is pending to start with", rb.flagReadBackDue == [])
+rb.schedule_flag_readback()
+check("a reset schedules two flag re-reads, at +5s and +15s",
+      len(rb.flagReadBackDue) == 2 and
+      4 < rb.flagReadBackDue[0] - time.time() <= 5 and
+      14 < rb.flagReadBackDue[1] - time.time() <= 15)
+check("the re-reads are in order, so popping the first is correct",
+      rb.flagReadBackDue[0] < rb.flagReadBackDue[1])
+
+# ------------------------------------------------ the sensors HA is told about
+published.clear()
+mon.tc = flag_tc()
+mon.TexecomMqtt.flag_sensors_announced = set()
+for n in range(1, 5):
+    mon.TexecomMqtt.area_flags_callback(mon.tc.get_area(n), 36, n == 1)
+
+cfg1 = published["homeassistant/binary_sensor/reset_required_intruder/config"]
+cfg2 = published["homeassistant/binary_sensor/reset_required_fire_co_alarms/config"]
+check("every area gets a discovery config",
+      sum(1 for t in published if t.endswith("/config")) == 4)
+check("the intruder sensor is enabled - it is the area HA can command",
+      cfg1["enabled_by_default"] is True)
+check("the areas HA cannot command register disabled",
+      cfg2["enabled_by_default"] is False)
+check("the sensor reads as a problem, not a plain on/off",
+      cfg1["device_class"] == "problem")
+check("each sensor has its own unique_id",
+      cfg1["unique_id"] != cfg2["unique_id"] and
+      cfg1["unique_id"] == "Elite.areaflag.36.intruder")
+check("the sensors join the existing Texecom device",
+      cfg1["device"]["identifiers"] == "123456789")
+check("availability is declared, so the sensors go unavailable with the app",
+      cfg1["availability_topic"] == "homeassistant/alarm_control_panel/state")
+check("the state payloads match what the config declares",
+      published["homeassistant/binary_sensor/reset_required_intruder/state"] ==
+      cfg1["payload_on"] == "True" and
+      published["homeassistant/binary_sensor/reset_required_fire_co_alarms/state"] ==
+      cfg1["payload_off"] == "False")
+
+before = len(published)
+mon.TexecomMqtt.area_flags_callback(mon.tc.get_area(1), 36, False)
+check("a repeat publish updates the state without republishing discovery",
+      len(published) == before and
+      published["homeassistant/binary_sensor/reset_required_intruder/state"] == "False")
+
+mon.TexecomMqtt.area_flags_callback(mon.tc.get_area(1), 21, True)
+check("a flag with no sensor defined publishes nothing",
+      "homeassistant/binary_sensor/reset_required_intruder" not in
+      [t.rsplit("/", 1)[0] for t in published if "21" in t])
+
+# ----------------------------------------------------- the audit line is stamped
+lines = []
+audit_tc = make_tc({5: ("test", "0192")})
+audit_tc.on_log_event(lines.append)
+mon.tc = audit_tc
+audit_tc.arm_disarm_reset_queue = []
+mon.TexecomMqtt.failed_attempts = 0
+mon.TexecomMqtt.locked_until = 0.0
+mon.TexecomMqtt.on_message(None, None, FakeMessage('{"action":"DISARM","code":"0192"}'))
+check("the accept line reaches the log topic",
+      any("DISARM accepted for user 5 'test'" in line for line in lines))
+check("the accept line carries a timestamp",
+      any(line[:2].isdigit() and line[4] == "-" and "DISARM accepted" in line
+          for line in lines))
+check("no line contains the code",
+      not any("0192" in line for line in lines))
+
+lines[:] = []
+mon.TexecomMqtt.on_message(None, None, FakeMessage('{"action":"DISARM","code":"9999"}'))
+check("a rejection is timestamped and logged too, with no code in it",
+      any("command rejected" in line for line in lines) and
+      not any("9999" in line for line in lines))
 
 print("")
 if FAILURES:
