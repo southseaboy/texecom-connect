@@ -375,6 +375,82 @@ check("an empty read answers None, not 'over'",
 check("None is not False, so the caller's 'is False' test keeps polling",
       (live.alarm_flag_set_anywhere({}) is False) is False)
 
+# ------------------- taking an area OUT of 'in alarm' (agreed 2026-09-19)
+# The panel never reports an area leaving alarm, so HA sat at 'triggered'
+# until a restart. Agreed definition: the alarm is over for an area when none
+# of AREA_FLAG_LIVE_ALARM is set on THAT area.
+IN_ALARM = 5      # AREA_STATE_INALARM
+DISARMED = 0
+ARMED = 3
+
+def alarm_over_tc(states, live_mask=0, armed_mask=0, drop=()):
+    """Areas in `states`; bitmaps for every watchlist flag unless dropped."""
+    f = flag_tc()
+    f.published = []
+    f.on_area_event(lambda area: f.published.append((area.number, area.state)))
+    for n, st in states.items():
+        f.get_area(n).save_state(st)
+    maps = {21: bitmap(armed_mask)}
+    for flag in TexecomConnect.AREA_FLAG_LIVE_ALARM:
+        maps[flag] = bitmap(live_mask)
+    for flag in drop:
+        maps.pop(flag, None)
+    return f, maps
+
+check("the watchlist carries every live-alarm flag, so the idle poll can decide",
+      set(TexecomConnect.AREA_FLAG_LIVE_ALARM)
+      <= set(TexecomConnect.AREA_FLAG_WATCHLIST))
+check("the watchlist still carries 21 Armed, for the state it then publishes",
+      21 in TexecomConnect.AREA_FLAG_WATCHLIST)
+
+f, maps = alarm_over_tc({1: IN_ALARM})
+f.clear_alarm_state_if_over(maps)
+check("alarm over and not armed -> the area is published DISARMED",
+      f.get_area(1).state == DISARMED and f.published == [(1, DISARMED)])
+
+f, maps = alarm_over_tc({1: IN_ALARM}, armed_mask=0b0001)
+f.clear_alarm_state_if_over(maps)
+check("alarm over but still armed -> ARMED, not disarmed",
+      f.get_area(1).state == ARMED and f.published == [(1, ARMED)])
+
+# The whole point: an alarm raised while DISARMED keeps flag 21 clear, so a
+# flag-21-only test would have cleared this one mid-alarm.
+f, maps = alarm_over_tc({1: IN_ALARM}, live_mask=0b0001)
+f.clear_alarm_state_if_over(maps)
+check("REGRESSION: a live alarm flag set while disarmed keeps HA triggered",
+      f.get_area(1).state == IN_ALARM and f.published == [])
+
+f, maps = alarm_over_tc({1: IN_ALARM, 2: IN_ALARM}, live_mask=0b0010)
+f.clear_alarm_state_if_over(maps)
+check("it is decided PER AREA - area 1 leaves alarm, area 2 stays in it",
+      f.get_area(1).state == DISARMED and f.get_area(2).state == IN_ALARM
+      and f.published == [(1, DISARMED)])
+
+f, maps = alarm_over_tc({1: ARMED, 2: DISARMED})
+f.clear_alarm_state_if_over(maps)
+check("an area that is not in alarm is never touched",
+      f.get_area(1).state == ARMED and f.published == [])
+
+f, maps = alarm_over_tc({1: IN_ALARM}, drop=(28,))
+f.clear_alarm_state_if_over(maps)
+check("a PARTIAL read cannot clear an alarm - one missing live flag aborts",
+      f.get_area(1).state == IN_ALARM and f.published == [])
+
+f, maps = alarm_over_tc({1: IN_ALARM}, drop=(21,))
+f.clear_alarm_state_if_over(maps)
+check("without flag 21 there is no state to publish, so nothing changes",
+      f.get_area(1).state == IN_ALARM and f.published == [])
+
+f, _ = alarm_over_tc({1: IN_ALARM})
+f.clear_alarm_state_if_over({})
+check("an empty read changes nothing rather than clearing the alarm",
+      f.get_area(1).state == IN_ALARM and f.published == [])
+
+f, maps = alarm_over_tc({1: IN_ALARM})
+check("the extra byte the panel returns does not bleed across areas",
+      not f.area_bit_set(bitmap(0b0010), 1)
+      and f.area_bit_set(bitmap(0b0010), 2))
+
 # ------------------------------------------------ the sensors HA is told about
 published.clear()
 mon.tc = flag_tc()

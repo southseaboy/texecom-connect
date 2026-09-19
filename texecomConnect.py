@@ -870,6 +870,63 @@ class TexecomConnect(TexecomDefines):
                 return True
         return False if answered else None
 
+    def area_bit_set(self, bitmap, areanumber):
+        """True if the bit for this area is set in one flag's bitmap."""
+        flags = int.from_bytes(bitmap[: self.areaBitmapSize], "little")
+        return (flags >> (areanumber - 1)) & 1 == 1
+
+    def clear_alarm_state_if_over(self, bitmaps):
+        """Take an area out of 'in alarm' once no LIVE alarm flag is set on it.
+
+        The panel reports an area ENTERING alarm as an event and never reports
+        it leaving - not by area state, not by zone state, not by log event,
+        not even on an engineer reset. Home Assistant therefore sat at
+        'triggered' until the app was restarted, because the only code path
+        that published a disarm was the startup enumeration, where area.state
+        is still None.
+
+        Definition agreed with the owner 2026-09-19: an area's alarm is over
+        when none of AREA_FLAG_LIVE_ALARM is set on that area. Flag 21 Armed
+        is NOT sufficient on its own - an alarm raised while the system is
+        disarmed (24hr audible, internal, fire/CO, PA, tamper) leaves 21 clear
+        throughout, so keying on it would publish 'disarmed' while the sounder
+        was still running.
+
+        The armed/disarmed state published afterwards is read from flag 21 in
+        the SAME bitmaps, so it cannot disagree with the alarm test and costs
+        no extra panel traffic.
+
+        Deliberately only moves an area OUT of AREA_STATE_INALARM. Arming
+        states arrive as events and are not second-guessed here.
+        """
+        if not bitmaps or 21 not in bitmaps:
+            return
+        if any(flag not in bitmaps for flag in self.AREA_FLAG_LIVE_ALARM):
+            # A partial read cannot show that an alarm is over. Never guess.
+            return
+        for areanumber in range(1, self.numberOfAreas + 1):
+            area = self.get_area(areanumber)
+            if area.state != self.AREA_STATE_INALARM:
+                continue
+            if any(
+                self.area_bit_set(bitmaps[flag], areanumber)
+                for flag in self.AREA_FLAG_LIVE_ALARM
+            ):
+                continue
+            newState = (
+                self.AREA_STATE_ARMED
+                if self.area_bit_set(bitmaps[21], areanumber)
+                else self.AREA_STATE_DISARMED
+            )
+            area.save_state(newState)
+            if self.area_event_func is not None:
+                self.area_event_func(area)
+            self.log(
+                "areaState {:d} '{}': {:d} {} (alarm over - no live alarm flag set)".format(
+                    areanumber, area.text, area.state, area.state_text
+                )
+            )
+
     def service_alarm_flag_polling(self):
         """One tick of fast polling. Caller guarantees no command is in flight."""
         self.alarmPollNext = time.time() + self.ALARM_POLL_INTERVAL
@@ -889,6 +946,8 @@ class TexecomConnect(TexecomDefines):
                 "areaFlags: no live alarm flag set on any area - ending fast poll"
             )
             self.alarmPollUntil = 0
+        # Per-area, so area 1 can leave alarm while area 2 is still in it.
+        self.clear_alarm_state_if_over(bitmaps)
 
     # Area flags published to Home Assistant as their own binary sensor.
     # Flag 36 is the panel's own "this area still needs a reset" state, and it
@@ -930,7 +989,10 @@ class TexecomConnect(TexecomDefines):
     # each one costs a round trip - keep this list short.
     #   00 Alarm, 05 24hr audible Alarm, 21 Armed, 36 Reset Required,
     #   61 Intruder Alarm
-    AREA_FLAG_WATCHLIST = [0, 5, 21, 36, 61]
+    # 0 Alarm and 36 Reset Required are watched because they are the panel's
+    # own memory of an alarm; 21 Armed gives armed/disarmed; the rest are the
+    # live-alarm flags, needed so the idle poll can tell when an alarm is over.
+    AREA_FLAG_WATCHLIST = [0, 5, 21, 28, 30, 36, 44, 61, 62]
 
     def read_area_flags_individually(self, flagnums):
         """Read the given area flags one command at a time.
@@ -1430,7 +1492,9 @@ class TexecomConnect(TexecomDefines):
                 else:
                     result = self.get_armed_area_state()
                     if result is not None:
-                        self.log_all_area_flags("idle")
+                        self.clear_alarm_state_if_over(
+                            self.log_all_area_flags("idle")
+                        )
                 self.lastIdleCommand += 1
                 if self.lastIdleCommand == 2:
                     self.lastIdleCommand = 0
