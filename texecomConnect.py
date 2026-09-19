@@ -810,6 +810,7 @@ class TexecomConnect(TexecomDefines):
         5,   # 24hr audible Alarm
         13,  # Auxiliary Alarm
         14,  # Tamper Alarm
+        15,  # Abort
         21,  # Armed
         28,  # Bell SAB
         29,  # Bell SCB
@@ -832,13 +833,42 @@ class TexecomConnect(TexecomDefines):
             )
         )
 
+    # The flags that mean "an alarm is happening NOW", as opposed to "an alarm
+    # happened". Only these end the fast poll.
+    #
+    # Flag 00 Alarm is deliberately NOT here. Proven 2026-09-19 on a staged
+    # confirmed intruder alarm: flag 00 was CLEAR at 09:56:04 while the alarm
+    # was sounding and only went SET at 09:56:35, after the disarm. It is alarm
+    # MEMORY, not alarm state, so the old flag-00 test ended fast polling in the
+    # middle of the event. Flags 01 Guard Alarm, 04 Confirmed Alarm and 15 Abort
+    # behaved the same way in the same run and are excluded for the same reason.
+    AREA_FLAG_LIVE_ALARM = [
+        5,   # 24hr audible Alarm
+        28,  # Bell SAB
+        30,  # Strobe
+        44,  # Internal Alarm
+        61,  # Intruder Alarm
+        62,  # Speaker Mimic
+    ]
+
     def alarm_flag_set_anywhere(self, bitmaps):
-        """True/False if flag 00 Alarm is set on any area, None if unknown."""
-        if not bitmaps or 0 not in bitmaps:
+        """True/False if any LIVE alarm flag is set on any area, None if unknown.
+
+        None means the question could not be answered - no live flag was read -
+        and the caller must not treat that as "the alarm is over".
+        """
+        if not bitmaps:
             return None
-        bitmap = bitmaps[0][: self.areaBitmapSize]
         areamask = (1 << self.numberOfAreas) - 1
-        return (int.from_bytes(bitmap, "little") & areamask) != 0
+        answered = False
+        for flagnum in self.AREA_FLAG_LIVE_ALARM:
+            bitmap = bitmaps.get(flagnum)
+            if bitmap is None:
+                continue
+            answered = True
+            if (int.from_bytes(bitmap[: self.areaBitmapSize], "little") & areamask) != 0:
+                return True
+        return False if answered else None
 
     def service_alarm_flag_polling(self):
         """One tick of fast polling. Caller guarantees no command is in flight."""
@@ -855,7 +885,9 @@ class TexecomConnect(TexecomDefines):
                 "alarm full sweep", list(range(len(self.AREA_FLAG_NAMES))), always=True
             )
         if self.alarm_flag_set_anywhere(bitmaps) is False:
-            self.log("areaFlags: flag 00 Alarm clear on all areas - ending fast poll")
+            self.log(
+                "areaFlags: no live alarm flag set on any area - ending fast poll"
+            )
             self.alarmPollUntil = 0
 
     # Area flags published to Home Assistant as their own binary sensor.
@@ -1375,7 +1407,9 @@ class TexecomConnect(TexecomDefines):
                 and time.time() >= self.flagReadBackDue[0]
             ):
                 self.flagReadBackDue.pop(0)
-                self.log_all_area_flags("after reset", always=True)
+                self.log_all_area_flags(
+                    "after reset", self.AREA_FLAG_ALARM_SET, always=True
+                )
             elif (
                 self.last_command is None
                 and time.time() < self.alarmPollUntil

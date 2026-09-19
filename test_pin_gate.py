@@ -329,6 +329,52 @@ check("a reset schedules two flag re-reads, at +5s and +15s",
 check("the re-reads are in order, so popping the first is correct",
       rb.flagReadBackDue[0] < rb.flagReadBackDue[1])
 
+# ------------------------------- when is the alarm OVER (reworked 2026-09-19)
+# Background: on a staged confirmed intruder alarm, flag 00 Alarm was CLEAR
+# while the alarm was sounding and only went SET after the disarm. The old
+# test keyed on flag 00 and so ended fast polling in the middle of the event.
+live = flag_tc()
+
+check("flag 00 is NOT a live-alarm flag - it is alarm memory",
+      0 not in TexecomConnect.AREA_FLAG_LIVE_ALARM)
+check("nor are 01/04/15, which latched the same way in the same run",
+      not ({1, 4, 15} & set(TexecomConnect.AREA_FLAG_LIVE_ALARM)))
+check("flag 15 Abort is in the alarm set, so a reset read-back can see it",
+      15 in TexecomConnect.AREA_FLAG_ALARM_SET)
+check("every live-alarm flag is also in the set that is actually polled",
+      set(TexecomConnect.AREA_FLAG_LIVE_ALARM)
+      <= set(TexecomConnect.AREA_FLAG_ALARM_SET))
+check("every flag seen latched on 2026-09-19 is in the reset read-back set",
+      {0, 1, 4, 15, 36} <= set(TexecomConnect.AREA_FLAG_ALARM_SET))
+check("the reset read-back asks for the alarm set, not the 5-flag watchlist",
+      '"after reset", self.AREA_FLAG_ALARM_SET'
+      in __import__("inspect").getsource(TexecomConnect))
+
+check("a live alarm flag set on one area means the alarm is not over",
+      live.alarm_flag_set_anywhere({61: bitmap(0b0010)}) is True)
+check("live flags all clear means the alarm IS over",
+      live.alarm_flag_set_anywhere({61: bitmap(0), 28: bitmap(0)}) is False)
+
+# The exact 2026-09-19 regression, as a test.
+sounding = {0: bitmap(0), 61: bitmap(0b0001),
+            28: bitmap(0b0001), 30: bitmap(0b0001)}
+check("REGRESSION: flag 00 clear mid-alarm no longer ends the fast poll",
+      live.alarm_flag_set_anywhere(sounding) is True)
+
+# ...and the converse: the aftermath must not hold the poll open for ever.
+aftermath = {0: bitmap(0b0001), 1: bitmap(0b0001), 4: bitmap(0b0001),
+             15: bitmap(0b0001), 5: bitmap(0), 28: bitmap(0), 30: bitmap(0),
+             44: bitmap(0), 61: bitmap(0), 62: bitmap(0)}
+check("memory flags left set after the disarm do not hold the poll open",
+      live.alarm_flag_set_anywhere(aftermath) is False)
+
+check("a read with no live flag in it answers None, not 'over'",
+      live.alarm_flag_set_anywhere({0: bitmap(0b1111)}) is None)
+check("an empty read answers None, not 'over'",
+      live.alarm_flag_set_anywhere({}) is None)
+check("None is not False, so the caller's 'is False' test keeps polling",
+      (live.alarm_flag_set_anywhere({}) is False) is False)
+
 # ------------------------------------------------ the sensors HA is told about
 published.clear()
 mon.tc = flag_tc()
