@@ -11,6 +11,20 @@ import time
 from texecomConnect import TexecomConnect
 from texecomDefines import TexecomDefines as D
 from user import User
+from test_fixtures import USERS, pick
+
+# Synthetic throughout - see test_fixtures.py. No real code or name here.
+U1_NAME, U1_CODE = USERS[1]
+U2_NAME, U2_CODE = USERS[2]
+U3_NAME, U3_CODE = USERS[3]
+U5_NAME, U5_CODE = USERS[5]
+WRONG_CODE = "9999"
+assert WRONG_CODE not in (U1_CODE, U2_CODE, U3_CODE, U5_CODE)
+
+
+def cmd(action, code):
+    """A well formed command payload."""
+    return json.dumps({"action": action, "code": code})
 
 FAILURES = []
 
@@ -51,17 +65,18 @@ def make_tc(codes):
 
 
 # ---------------------------------------------------------------- matching
-tc = make_tc({1: ("Master", "5678"), 3: ("Chris", "5112"), 5: ("test", "0192")})
+tc = make_tc(pick(1, 3, 5))
 
 check("a correct code matches the right user",
-      tc.find_user_by_code("0192") == ("match", 5, "test"))
+      tc.find_user_by_code(U5_CODE) == ("match", 5, U5_NAME))
 check("a wrong code matches nobody",
-      tc.find_user_by_code("9999")[0] == "none")
+      tc.find_user_by_code(WRONG_CODE)[0] == "none")
 check("a code of the wrong length does not match",
-      tc.find_user_by_code("192")[0] == "none")
+      tc.find_user_by_code(U5_CODE[1:])[0] == "none")
 check("a leading zero is significant",
-      tc.find_user_by_code("192")[0] == "none" and
-      tc.find_user_by_code("0192")[0] == "match")
+      U5_CODE.startswith("0") and
+      tc.find_user_by_code(U5_CODE[1:])[0] == "none" and
+      tc.find_user_by_code(U5_CODE)[0] == "match")
 check("a non-numeric code is rejected",
       tc.find_user_by_code("abcd")[0] == "none")
 check("an empty code is rejected",
@@ -94,7 +109,7 @@ check("arming as user 0 is refused before anything is sent",
       make_tc({}).arm_disarm_as_user(D.CMD_ARMAREASASUSER, 0) is False)
 
 # ------------------------------------------------------------- user table
-refresh = make_tc({1: ("Master", "5678")})
+refresh = make_tc(pick(1))
 refresh.numberOfUsers = 50
 refresh.get_user = lambda n: None          # every read fails
 before = dict(refresh.users)
@@ -105,7 +120,7 @@ check("a failed refresh keeps the previous user table rather than emptying it",
 rebuild = make_tc({})
 rebuild.numberOfUsers = 4
 built = {}
-for n, (nm, cd) in {1: ("Master", "5678"), 2: ("Mark", "2229")}.items():
+for n, (nm, cd) in pick(1, 2).items():
     u = User()
     u.name, u.passcode = nm, cd
     built[n] = u
@@ -115,7 +130,7 @@ rebuild.get_all_users()
 check("a good refresh replaces the table and re-arms the daily timer",
       set(rebuild.users) == {0, 1, 2} and rebuild.next_user_refresh > time.time())
 check("the rebuilt table matches codes",
-      rebuild.find_user_by_code("2229") == ("match", 2, "Mark"))
+      rebuild.find_user_by_code(U2_CODE) == ("match", 2, U2_NAME))
 
 # ------------------------------------------- Site Data Changed triggers it
 ev = make_tc({})
@@ -136,8 +151,8 @@ mon.topic_subs = ["intruder"]
 mon.topic_areamaps = ["01000000000000"]
 
 check("a well formed command parses",
-      mon.TexecomMqtt.parse_command(b'{"action":"DISARM","code":"0192"}') ==
-      ("DISARM", "0192"))
+      mon.TexecomMqtt.parse_command(cmd("DISARM", U5_CODE).encode()) ==
+      ("DISARM", U5_CODE))
 check("a bare string carries no code and is not a command",
       mon.TexecomMqtt.parse_command(b"DISARM") == (None, None))
 check("malformed JSON is not a command",
@@ -155,23 +170,23 @@ check("undecodable bytes are not a command",
 def fresh_route():
     mon.TexecomMqtt.failed_attempts = 0
     mon.TexecomMqtt.locked_until = 0.0
-    routed = make_tc({3: ("Chris", "5112"), 5: ("test", "0192")})
+    routed = make_tc(pick(3, 5))
     routed.arm_disarm_reset_queue = []
     mon.tc = routed
     return routed
 
 r = fresh_route()
-mon.TexecomMqtt.on_message(None, None, FakeMessage('{"action":"ARM_AWAY","code":"5112"}'))
+mon.TexecomMqtt.on_message(None, None, FakeMessage(cmd("ARM_AWAY", U3_CODE)))
 check("a valid code arms as that user",
       r.arm_disarm_reset_queue == [("user", D.CMD_ARMAREASASUSER, 3, None)])
 
 r = fresh_route()
-mon.TexecomMqtt.on_message(None, None, FakeMessage('{"action":"DISARM","code":"0192"}'))
+mon.TexecomMqtt.on_message(None, None, FakeMessage(cmd("DISARM", U5_CODE)))
 check("a valid code disarms as that user",
       r.arm_disarm_reset_queue == [("user", D.CMD_DISARMAREASASUSER, 5, None)])
 
 r = fresh_route()
-mon.TexecomMqtt.on_message(None, None, FakeMessage('{"action":"reset","code":"5112"}'))
+mon.TexecomMqtt.on_message(None, None, FakeMessage(cmd("reset", U3_CODE)))
 check("reset is code gated and sent anonymously to the areas",
       len(r.arm_disarm_reset_queue) == 1 and
       r.arm_disarm_reset_queue[0][:2] == ("areas", D.CMD_RESETAREAS))
@@ -182,18 +197,18 @@ check("A6: a bare DISARM publish is refused - broker access alone is not enough"
       r.arm_disarm_reset_queue == [])
 
 r = fresh_route()
-mon.TexecomMqtt.on_message(None, None, FakeMessage('{"action":"DISARM","code":"9999"}'))
+mon.TexecomMqtt.on_message(None, None, FakeMessage(cmd("DISARM", WRONG_CODE)))
 check("a wrong code sends nothing to the panel",
       r.arm_disarm_reset_queue == [])
 
 r = fresh_route()
-mon.TexecomMqtt.on_message(None, None, FakeMessage('{"action":"ARM_NIGHT","code":"5112"}'))
+mon.TexecomMqtt.on_message(None, None, FakeMessage(cmd("ARM_NIGHT", U3_CODE)))
 check("an unimplemented action is dropped, but only after a valid code",
       r.arm_disarm_reset_queue == [])
 
 r = fresh_route()
 mon.TexecomMqtt.on_message(None, None, FakeMessage(
-    '{"action":"DISARM","code":"0192"}',
+    cmd("DISARM", U5_CODE),
     topic="homeassistant/alarm_control_panel/somewhere_else/command"))
 check("a command for an unknown area topic is ignored",
       r.arm_disarm_reset_queue == [])
@@ -201,8 +216,8 @@ check("a command for an unknown area topic is ignored",
 # ------------------------------------------------------------------ lockout
 r = fresh_route()
 for _ in range(4):
-    mon.TexecomMqtt.on_message(None, None, FakeMessage('{"action":"DISARM","code":"9999"}'))
-mon.TexecomMqtt.on_message(None, None, FakeMessage('{"action":"DISARM","code":"0192"}'))
+    mon.TexecomMqtt.on_message(None, None, FakeMessage(cmd("DISARM", WRONG_CODE)))
+mon.TexecomMqtt.on_message(None, None, FakeMessage(cmd("DISARM", U5_CODE)))
 check("4 failures do not lock out - a correct code still works",
       r.arm_disarm_reset_queue == [("user", D.CMD_DISARMAREASASUSER, 5, None)])
 check("a success clears the failure count",
@@ -210,16 +225,16 @@ check("a success clears the failure count",
 
 r = fresh_route()
 for _ in range(5):
-    mon.TexecomMqtt.on_message(None, None, FakeMessage('{"action":"DISARM","code":"9999"}'))
+    mon.TexecomMqtt.on_message(None, None, FakeMessage(cmd("DISARM", WRONG_CODE)))
 check("the 5th failure starts a lockout",
       mon.TexecomMqtt.locked_until > time.time())
-mon.TexecomMqtt.on_message(None, None, FakeMessage('{"action":"DISARM","code":"0192"}'))
+mon.TexecomMqtt.on_message(None, None, FakeMessage(cmd("DISARM", U5_CODE)))
 check("a correct code is refused while locked out",
       r.arm_disarm_reset_queue == [])
 check("the lockout is 15 minutes",
       894 < mon.TexecomMqtt.locked_until - time.time() <= 900)
 mon.TexecomMqtt.locked_until = time.time() - 1
-mon.TexecomMqtt.on_message(None, None, FakeMessage('{"action":"DISARM","code":"0192"}'))
+mon.TexecomMqtt.on_message(None, None, FakeMessage(cmd("DISARM", U5_CODE)))
 check("once the lockout expires a correct code works again",
       r.arm_disarm_reset_queue == [("user", D.CMD_DISARMAREASASUSER, 5, None)])
 
@@ -494,23 +509,24 @@ check("a flag with no sensor defined publishes nothing",
 
 # ----------------------------------------------------- the audit line is stamped
 lines = []
-audit_tc = make_tc({5: ("test", "0192")})
+audit_tc = make_tc(pick(5))
 audit_tc.on_log_event(lines.append)
 mon.tc = audit_tc
 audit_tc.arm_disarm_reset_queue = []
 mon.TexecomMqtt.failed_attempts = 0
 mon.TexecomMqtt.locked_until = 0.0
-mon.TexecomMqtt.on_message(None, None, FakeMessage('{"action":"DISARM","code":"0192"}'))
+mon.TexecomMqtt.on_message(None, None, FakeMessage(cmd("DISARM", U5_CODE)))
 check("the accept line reaches the log topic",
-      any("DISARM accepted for user 5 'test'" in line for line in lines))
+      any("DISARM accepted for user 5 '{}'".format(U5_NAME) in line
+          for line in lines))
 check("the accept line carries a timestamp",
       any(line[:2].isdigit() and line[4] == "-" and "DISARM accepted" in line
           for line in lines))
 check("no line contains the code",
-      not any("0192" in line for line in lines))
+      not any(U5_CODE in line for line in lines))
 
 lines[:] = []
-mon.TexecomMqtt.on_message(None, None, FakeMessage('{"action":"DISARM","code":"9999"}'))
+mon.TexecomMqtt.on_message(None, None, FakeMessage(cmd("DISARM", WRONG_CODE)))
 check("a rejection is timestamped and logged too, with no code in it",
       any("command rejected" in line for line in lines) and
       not any("9999" in line for line in lines))

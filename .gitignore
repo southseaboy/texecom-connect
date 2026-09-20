@@ -2,3 +2,7 @@
 *.pyc
 docker-compose_local.yaml
 Dockerfile_ENV
+
+# Local, site-specific test fixtures - real user/zone/area names.
+# Never commit: this repository is public.
+site_local.py

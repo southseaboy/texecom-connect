@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Refuse a commit that would publish site-specific detail.
+
+This repository is public. The failure mode it guards against is not an
+untracked file slipping in - .gitignore handles that - but a real name,
+code or address being typed into a file that is already tracked.
+
+Two independent checks run over the ADDED lines of the staged diff:
+
+  1. a local deny-list of salted hashes, held outside the working tree
+     (see hooks/denylist.py), so the words themselves are never in the repo;
+  2. generic structural patterns that need no local knowledge at all.
+
+Enable in a clone with:   git config core.hooksPath hooks
+Bypass, deliberately:     git commit --no-verify   (git offers no way to
+                          prevent this - it is a guard rail, not a lock)
+"""
+import re
+import subprocess
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import denylist  # noqa: E402
+
+# Patterns that are site-independent, so they can live in a public file.
+# Anything that would name THIS site belongs in the deny-list instead.
+STRUCTURAL = [
+    (re.compile(r"\b(?:10|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b"),
+     "a private IPv4 address"),
+    (re.compile(r"(?i)\b(?:passcode|password|passwd|udlpassword|secret|api[_-]?key)"
+                r"\s*[:=]\s*[\"'][^\"']+[\"']"),
+     "a credential assigned a literal value"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "a private key"),
+]
+
+
+def added_lines():
+    """(path, lineno, text) for every line this commit adds."""
+    diff = subprocess.run(
+        ["git", "diff", "--cached", "--unified=0", "--no-color",
+         "--diff-filter=ACMR"],
+        stdout=subprocess.PIPE, check=True).stdout.decode("utf-8", "replace")
+    path, lineno = None, 0
+    for line in diff.split("\n"):
+        if line.startswith("+++ b/"):
+            path = line[6:]
+        elif line.startswith("@@"):
+            match = re.search(r"\+(\d+)", line)
+            lineno = int(match.group(1)) if match else 0
+        elif line.startswith("+") and not line.startswith("+++"):
+            yield (path, lineno, line[1:])
+            lineno += 1
+
+
+def main():
+    try:
+        salt, hashes = denylist.load()
+    except (IOError, OSError):
+        sys.stderr.write(
+            "pre-commit: no deny-list at {}\n"
+            "The hook is enabled, so it fails closed rather than pretend to\n"
+            "be protecting you. Create it with:  hooks/denylist.py init\n"
+            .format(denylist.path()))
+        return 1
+    except ValueError as exc:
+        sys.stderr.write("pre-commit: {}\n".format(exc))
+        return 1
+
+    problems = []
+    for path, lineno, text in added_lines():
+        # The deny-list must never be checked against itself.
+        hits = [t for t in denylist.tokens(text)
+                if denylist.digest(salt, t) in hashes]
+        if hits:
+            problems.append((path, lineno, "deny-listed: " + denylist.mask(hits)))
+        for pattern, what in STRUCTURAL:
+            if pattern.search(text):
+                problems.append((path, lineno, what))
+
+    if not problems:
+        return 0
+
+    sys.stderr.write("\npre-commit: refusing to commit - this is a PUBLIC repository\n\n")
+    for path, lineno, what in problems:
+        sys.stderr.write("  {}:{}  {}\n".format(path, lineno, what))
+    sys.stderr.write(
+        "\nMatched words are masked on purpose. Move the value into an\n"
+        "untracked local file (site_local.py is already ignored) and keep\n"
+        "the committed code generic.\n\n")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
