@@ -162,6 +162,10 @@ class TexecomMqtt:
             # here but anonymous in the panel's own log.
             TexecomMqtt.audit("reset accepted for user {:d} '{}' (anonymous at the panel)".format(
                 usernumber, username))
+            # The panel logs 'Reset After Alarm' with no user, so this is the
+            # only place the requester is known - hand it to the library to
+            # correlate with the log event that follows a second or two later.
+            tc.note_reset_request(usernumber, username)
             tc.requestResetAreas(area_bitmap)
         else:
             # Never drop an unknown action silently: a user could otherwise
@@ -349,11 +353,64 @@ class TexecomMqtt:
 
     @staticmethod
     def alive_event():
+        TexecomMqtt.announce_event_entity()
         available = "online"
         topic = topic_root + "/alarm_control_panel/state"
         if TexecomMqtt.log_mqtt_traffic:
             print("MQTT Update %s: %s" % (topic, available))
         client.publish(topic, available, retain=True)
+
+    # One HA 'event' entity carrying every panel log record. Separate from
+    # the log topic, which carries every line this app prints - heartbeats,
+    # flag polls and all - as free text that nothing consumes.
+    EVENT_TYPES = [
+        "trigger", "alarm_confirmed", "bell", "alarm_aux",
+        "tamper", "tamper_restore",
+        "arm", "disarm", "arm_failed", "exit", "entry", "user_code",
+        "reset", "restore", "fault", "other",
+    ]
+    event_entity_announced = False
+
+    @staticmethod
+    def announce_event_entity():
+        if TexecomMqtt.event_entity_announced:
+            return
+        if tc is None or tc.panelType is None:
+            # Before the panel has identified itself there is no device to
+            # attach the entity to; the next call will do it.
+            return
+        configtopic = config_root + "/event/panel_event/config"
+        message = {
+            "name": "Panel event",
+            "state_topic": topic_root + "/alarm_control_panel/event",
+            "event_types": TexecomMqtt.EVENT_TYPES,
+            "unique_id": ".".join([tc.panelType, "panelevent"]),
+            "device": {
+                "name": "Texecom " + tc.panelType + " " + str(tc.numberOfZones),
+                "identifiers": "123456789",
+                "manufacturer": "Texecom",
+                "model": tc.panelType + " " + str(tc.numberOfZones)
+            }
+        }
+        message.update(TexecomMqtt.availability())
+        if TexecomMqtt.log_mqtt_traffic:
+            print("MQTT Update %s: %s" % (configtopic, json.dumps(message)))
+        client.publish(configtopic, json.dumps(message), retain=True)
+        TexecomMqtt.event_entity_announced = True
+
+    @staticmethod
+    def panel_event(event):
+        """Publish one decoded panel log record.
+
+        NOT retained: a retained event is replayed to Home Assistant on
+        every reconnect and stamped as if it had just happened.
+        """
+        TexecomMqtt.announce_event_entity()
+        topic = topic_root + "/alarm_control_panel/event"
+        payload = json.dumps(event)
+        if TexecomMqtt.log_mqtt_traffic:
+            print("MQTT Update %s: %s" % (topic, payload))
+        client.publish(topic, payload, retain=False)
 
     @staticmethod
     def log_event(message):
@@ -428,6 +485,7 @@ if __name__ == "__main__":
     client.will_set(
         topic_root + "/alarm_control_panel/state", "offline", retain=True
     )
+    tc = None
     print("connecting to broker ", broker_url)
     client.connect(broker_url, broker_port)
     client.loop_start()
@@ -440,6 +498,7 @@ if __name__ == "__main__":
     tc.on_area_details(TexecomMqtt.area_details_callback)
     tc.on_zone_details(TexecomMqtt.zone_details_callback)
     tc.on_log_event(TexecomMqtt.log_event)
+    tc.on_panel_event(TexecomMqtt.panel_event)
     tc.on_area_flags(TexecomMqtt.area_flags_callback)
 
     atexit.register(TexecomMqtt.exiting)

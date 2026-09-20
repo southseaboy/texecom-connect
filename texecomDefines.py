@@ -266,3 +266,121 @@ class TexecomDefines:
     log_event_group_type[33] = "Bad Action"
     log_event_group_type[34] = "PA Timer Reset"
     log_event_group_type[35] = "PA Zone Lockout"
+
+    # ------------------------------------------------------------------
+    # Log-event semantics: what a record MEANS, for Home Assistant
+    #
+    # These tables describe the PROTOCOL, not this site. They do not hold
+    # any user or zone name - those are read from the panel itself at every
+    # startup (get_site_data) and refreshed on log event 100 'Site Data
+    # Changed', so nothing here has to be maintained when a user or a zone
+    # is renamed.
+    #
+    # 🔴 The specs we hold do NOT document the `parameter` field. 'Get Raw
+    # Log Event' (Payload Spec 4.16.3) defers to "appendix A for more
+    # details" and that appendix covers only area flags. The mappings below
+    # are therefore INFERENCE, except where marked PROVEN by a live capture
+    # on this panel. An event type in neither set publishes its parameter
+    # raw and unlabelled rather than guessing.
+
+    # parameter is a user number
+    LOG_PARAM_USER = frozenset([
+        26,   # Duress Code Alarm
+        31,   # User Code                      PROVEN by live capture
+        37,   # Open/Close (Away Armed)
+        38,   # Part Armed
+        41,   # Open After Alarm (Alarm Abort)
+        42,   # Remote Open/Close              PROVEN by live capture
+        44,   # Recent Closing
+        74,   # User Walk Test Start/End
+        77,   # Door Access
+        78, 79, 80,   # Part Arm 1 / 2 / 3
+        83,   # Prox Tag
+        84,   # Access Code Changed/Deleted
+        89, 90, 91, 92,   # TAG System Exit/Entry (Batt. OK/LOW)
+        111,  # Door Access
+        114, 115,     # User Added / User Deleted
+        117,  # User Acknowledged
+    ])
+
+    # parameter is a zone number
+    LOG_PARAM_ZONE = frozenset([
+        1, 2,         # Entry/Exit 1, Entry/Exit 2
+        3,            # Interior                PROVEN by live capture
+        4,            # Perimeter
+        5, 6,         # 24hr Audible / Silent
+        7, 8,         # Audible PA / Silent PA
+        9, 10, 11, 12,    # Fire, Medical, Gas, Auxiliary
+        13,           # 24hr Tamper Alarm
+        14,           # Exit Terminator
+        15, 16, 17, 18,   # Keyswitch / Security Key / Omit Key
+        19,           # Custom Alarm
+        30,           # Verified Cross Zone Alarm
+        67, 68,       # Fire Zone Tamper / Zone Tamper
+        71,           # Soak Test Alarm
+        76,           # First Knock
+        87,           # iD Loop Shorted
+        97,           # Supervision Fault
+        99,           # RF Device Low Battery
+        104, 105,     # Zone Fault / Zone Masked
+    ])
+
+    # Event types that are a tamper whatever their group type says.
+    LOG_TAMPER_EVENTS = frozenset([
+        13, 60, 61, 62, 63, 64, 67, 68, 70, 110, 121,
+    ])
+
+    # Category by event type. Checked BEFORE the group type, because the
+    # group alone misclassifies: 'Reset After Alarm' carries group 'Open',
+    # which would otherwise read as a disarm.
+    LOG_CATEGORY_BY_EVENT = {
+        26: "trigger",          # Duress Code Alarm
+        27: "alarm_aux",        # Alarm Active   - no cause, fires alongside
+        28: "bell",             # Bell Active    - the siren is running
+        29: "alarm_aux",        # Re-arm
+        30: "trigger",          # Verified Cross Zone Alarm
+        31: "user_code",        # a code was entered - not itself an action
+        32: "exit",             # Exit Started
+        33: "arm_failed",       # Exit Error (Arming Failed)
+        34: "entry",            # Entry Started
+        41: "reset",            # Open After Alarm (Alarm Abort)
+        45: "reset",            # Reset After Alarm
+        82: "alarm_confirmed",  # Confirmed Alarm
+        83: "user_code",        # Prox Tag presented
+        85: "arm_failed",       # Arm Failed
+        112: "reset",           # CIE Reset
+        116: "alarm_confirmed", # Confirmed PA
+        117: "reset",           # User Acknowledged
+        120: "alarm_confirmed", # Confirmed Intruder
+    }
+
+    # Fallback by group type. 37 'Open/Close (Away Armed)' and 42 'Remote
+    # Open/Close' deliberately land here: arm and disarm are the SAME event
+    # type on this panel, separated only by Close vs Open.
+    LOG_CATEGORY_BY_GROUP = {
+        1: "trigger",           # Priority Alarm
+        2: "restore",           # Priority Alarm Restore
+        3: "trigger",           # Alarm
+        4: "restore",           # Restore
+        5: "disarm",            # Open
+        6: "arm",               # Close          PROVEN by live capture
+        15: "disarm",           # Disarmed
+        16: "arm",              # Armed
+        20: "fault",            # Fault
+        29: "fault",            # Low Battery
+    }
+
+    # Categories that carry enough to be worth a phone alert. Everything
+    # else is still published and still lands in the Home Assistant
+    # timeline - it just does not notify.
+    LOG_CATEGORY_NOTIFY = frozenset([
+        "trigger", "alarm_confirmed", "bell", "tamper",
+        "arm", "disarm", "reset", "arm_failed",
+    ])
+
+    # A panel reset is anonymous in the panel's own log: the record's
+    # parameter has been observed holding a value that is not a user number
+    # at all. When the reset was requested THROUGH Home Assistant we know
+    # who asked, so it is correlated back within this window and published
+    # with cause_source 'ha' rather than 'panel'.
+    RESET_ATTRIBUTION_SECS = 60

@@ -58,6 +58,7 @@ class TexecomConnect(TexecomDefines):
         self.zone_details_func = None
         self.zone_event_func = None
         self.log_event_func = None
+        self.panel_event_func = None
         self.area_flags_func = None
         self.numberOfZones = None
         self.highestUsedZone = None
@@ -90,6 +91,11 @@ class TexecomConnect(TexecomDefines):
         self.lastIdleCommand = 0
         # Set to true if the idle loop should reread the site data
         self.siteDataChanged = False
+        # (time, usernumber, username) of the last reset accepted from Home
+        # Assistant, so the panel's anonymous 'Reset After Alarm' can be
+        # attributed. Rebound, never mutated: it is written from the MQTT
+        # thread and read from the main thread.
+        self.resetRequest = None
 
     ## texecom commands
     # in order of their command number
@@ -1173,6 +1179,23 @@ class TexecomConnect(TexecomDefines):
     def on_log_event(self, log_event_func):
         self.log_event_func = log_event_func
 
+    def on_panel_event(self, panel_event_func):
+        """Structured panel log events, for Home Assistant notifications.
+
+        Separate from on_log_event, which carries every line this app
+        prints - heartbeats, flag polls and all - as free text.
+        """
+        self.panel_event_func = panel_event_func
+
+    def note_reset_request(self, usernumber, username):
+        """Record who asked Home Assistant for a panel reset.
+
+        The panel logs a reset anonymously, so this is the only place the
+        requesting user is known. Consumed once, by the next 'Reset After
+        Alarm' within RESET_ATTRIBUTION_SECS.
+        """
+        self.resetRequest = (time.time(), usernumber, username)
+
     def on_area_flags(self, area_flags_func):
         self.area_flags_func = area_flags_func
 
@@ -1344,11 +1367,19 @@ class TexecomConnect(TexecomDefines):
                 group_type_str = self.log_event_group_type[group_type]
             else:
                 group_type_str = "Unknown log event group type {:d}".format(group_type)
+            group_name = group_type_str
 
             if comm_delayed:
                 group_type_str += " [comm delayed]"
             if communicated:
                 group_type_str += " [communicated]"
+
+            if self.panel_event_func is not None:
+                self.panel_event_func(self.build_panel_event(
+                    event_type, event_str, group_type, group_name,
+                    parameter, areas, timestamp_str,
+                    bool(comm_delayed), bool(communicated),
+                ))
 
             return "Log event message: {} {}, {} parameter: {:d} areas: {:d}".format(
                 timestamp_str, event_str, group_type_str, parameter, areas
@@ -1695,6 +1726,119 @@ class TexecomConnect(TexecomDefines):
 
 
     ### General helpers
+
+    def areas_from_bitmap(self, areas_bitmap):
+        """(numbers, names) of the areas set in a log record's area bitmap."""
+        numbers, names = [], []
+        number, bit = 1, 1
+        while bit <= areas_bitmap:
+            if areas_bitmap & bit:
+                numbers.append(number)
+                area = self.areas.get(number)
+                names.append(area.text if area is not None
+                             else "Area{:d}".format(number))
+            number += 1
+            bit <<= 1
+        return numbers, names
+
+    def classify_log_event(self, event_type, group_type):
+        """The category Home Assistant consumes.
+
+        Group type wins for tamper, because it is the only thing that
+        separates a tamper from its restore. Otherwise the event type is
+        checked first: the group type alone misclassifies, e.g. 'Reset
+        After Alarm' carries group 'Open' and would read as a disarm.
+        """
+        if group_type == 11:
+            return "tamper"
+        if group_type == 12:
+            return "tamper_restore"
+        if event_type in self.LOG_CATEGORY_BY_EVENT:
+            return self.LOG_CATEGORY_BY_EVENT[event_type]
+        if event_type in self.LOG_TAMPER_EVENTS:
+            return "tamper"
+        return self.LOG_CATEGORY_BY_GROUP.get(group_type, "other")
+
+    def resolve_log_parameter(self, event_type, parameter):
+        """(kind, number, name, resolved) for a log record's parameter.
+
+        Names come from the panel's own tables, read at startup and
+        refreshed on 'Site Data Changed'. NOTHING here is hand-maintained.
+
+        A name is never invented. `resolved` is False only where the
+        parameter is known to name something we could not name - so an
+        unresolved cause can never be mistaken for an absent one.
+        """
+        if event_type in self.LOG_PARAM_USER:
+            if parameter == 0:
+                # Ambiguous on this panel: user 00 IS the Engineer, but the
+                # panel also writes 0 for 'no user attributed'. Do not guess.
+                return ("user", 0, None, False)
+            user = self.users.get(parameter)
+            if user is not None and user.name:
+                return ("user", parameter, user.name, True)
+            return ("user", parameter, None, False)
+        if event_type in self.LOG_PARAM_ZONE:
+            zone = self.zones.get(parameter)
+            if zone is not None and zone.text:
+                return ("zone", parameter, zone.text, True)
+            return ("zone", parameter, None, False)
+        # Not a parameter we can label: publish the number raw.
+        return ("none", parameter, None, True)
+
+    def build_panel_event(self, event_type, event_str, group_type, group_name,
+                          parameter, areas_bitmap, timestamp_str,
+                          comm_delayed, communicated):
+        """Turn a decoded log record into the dict published to MQTT."""
+        category = self.classify_log_event(event_type, group_type)
+        kind, number, name, resolved = self.resolve_log_parameter(
+            event_type, parameter
+        )
+        source = "panel"
+
+        if event_type == 45 and self.resetRequest is not None:
+            # 'Reset After Alarm' is anonymous at the panel. If Home
+            # Assistant asked for this one, we know who asked.
+            requested_at, usernumber, username = self.resetRequest
+            if time.time() - requested_at <= self.RESET_ATTRIBUTION_SECS:
+                kind, number, name, resolved = ("user", usernumber, username, True)
+                source = "ha"
+            # Consumed either way: a stale request must never be attached to
+            # a later reset done at the keypad or in Wintex.
+            self.resetRequest = None
+
+        numbers, names = self.areas_from_bitmap(areas_bitmap)
+
+        text = "{}, {}".format(event_str, group_name)
+        if kind != "none":
+            if name is not None:
+                text += " - {} {:d} {}".format(kind, number, name)
+            else:
+                text += " - {} {:d} (unidentified)".format(kind, number)
+        if names:
+            text += " (" + ", ".join(names) + ")"
+
+        return {
+            # HA's MQTT event platform requires this key.
+            "event_type": category,
+            "panel_time": timestamp_str.replace(" ", "T"),
+            "received": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "type_id": event_type,
+            "type": event_str,
+            "group_id": group_type,
+            "group": group_name,
+            "cause_kind": kind,
+            "cause_number": number,
+            "cause": name,
+            "cause_resolved": resolved,
+            "cause_source": source,
+            "areas": numbers,
+            "area_names": names,
+            "comm_delayed": comm_delayed,
+            "communicated": communicated,
+            "notify": category in self.LOG_CATEGORY_NOTIFY,
+            "text": text,
+        }
 
     def log(self, string):
         timestamp = time.strftime("%Y-%m-%d %X")
