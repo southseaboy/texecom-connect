@@ -366,7 +366,8 @@ class TexecomMqtt:
     EVENT_TYPES = [
         "trigger", "alarm_confirmed", "bell", "alarm_aux",
         "tamper", "tamper_restore",
-        "arm", "disarm", "arm_failed", "exit", "entry", "user_code",
+        "arm", "disarm", "arm_failed", "exit_error", "exit_error_cleared",
+        "exit", "entry", "user_code",
         "reset", "restore", "fault", "other",
     ]
     event_entity_announced = False

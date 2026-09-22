@@ -319,6 +319,8 @@ class TexecomDefines:
         67, 68,       # Fire Zone Tamper / Zone Tamper
         71,           # Soak Test Alarm
         76,           # First Knock
+        85,           # Arm Failed - the zone that stopped the arm
+                      # (zone 10 on 2026-09-21, active at that second)
         87,           # iD Loop Shorted
         97,           # Supervision Fault
         99,           # RF Device Low Battery
@@ -341,7 +343,7 @@ class TexecomDefines:
         30: "trigger",          # Verified Cross Zone Alarm
         31: "user_code",        # a code was entered - not itself an action
         32: "exit",             # Exit Started
-        33: "arm_failed",       # Exit Error (Arming Failed)
+        33: "exit_error",       # Exit Error (Arming Failed) - see BY_EVENT_GROUP
         34: "entry",            # Entry Started
         41: "reset",            # Open After Alarm (Alarm Abort)
         45: "reset",            # Reset After Alarm
@@ -352,6 +354,14 @@ class TexecomDefines:
         116: "alarm_confirmed", # Confirmed PA
         117: "reset",           # User Acknowledged
         120: "alarm_confirmed", # Confirmed Intruder
+    }
+
+    # Event types whose category depends on the group as well. Checked
+    # before LOG_CATEGORY_BY_EVENT. One failed arm writes Exit Error/Open and
+    # Arm Failed together, then Exit Error/Close when it is cleared - only
+    # Arm Failed carries the zone, so only it is the loud 'arm_failed'.
+    LOG_CATEGORY_BY_EVENT_GROUP = {
+        (33, 6): "exit_error_cleared",  # Exit Error, Close
     }
 
     # Fallback by group type. 37 'Open/Close (Away Armed)' and 42 'Remote
@@ -376,6 +386,7 @@ class TexecomDefines:
     LOG_CATEGORY_NOTIFY = frozenset([
         "trigger", "alarm_confirmed", "bell", "tamper",
         "arm", "disarm", "reset", "arm_failed",
+        "exit_error", "exit_error_cleared",
     ])
 
     # A panel reset is anonymous in the panel's own log: the record's

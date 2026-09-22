@@ -1823,6 +1823,8 @@ class TexecomConnect(TexecomDefines):
             return "tamper"
         if group_type == 12:
             return "tamper_restore"
+        if (event_type, group_type) in self.LOG_CATEGORY_BY_EVENT_GROUP:
+            return self.LOG_CATEGORY_BY_EVENT_GROUP[(event_type, group_type)]
         if event_type in self.LOG_CATEGORY_BY_EVENT:
             return self.LOG_CATEGORY_BY_EVENT[event_type]
         if event_type in self.LOG_TAMPER_EVENTS:

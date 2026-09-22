@@ -248,6 +248,38 @@ _, ev = capture(make_tc(), logevent(85, 33, 0, 1, (2026, 9, 20, 12, 0, 0)))
 check("arm failed: category", ev["event_type"] == "arm_failed")
 check("arm failed: notifies", ev["notify"] is True)
 
+# The three records of the 2026-09-21 15:10 failed arm, text asserted first.
+# Before: all three were 'arm_failed' (three alarm-volume pushes) and none
+# named the zone.
+EXIT_ERROR = [
+    (logevent(33, 5, 0, 1, (2026, 9, 21, 15, 10, 17)),
+     "Log event message: 2026-09-21 15:10:17 Exit Error (Arming Failed), Open parameter: 0 areas: 1"),
+    (logevent(85, 0, 10, 1, (2026, 9, 21, 15, 10, 17)),
+     "Log event message: 2026-09-21 15:10:17 Arm Failed, Not Reported parameter: 10 areas: 1"),
+    (logevent(33, 6, 0, 1, (2026, 9, 21, 15, 16, 46)),
+     "Log event message: 2026-09-21 15:16:46 Exit Error (Arming Failed), Close parameter: 0 areas: 1"),
+]
+got = [capture(make_tc(), payload) for payload, _ in EXIT_ERROR]
+for (text, _), (_, expected) in zip(got, EXIT_ERROR):
+    check("2026-09-21 record renders as the panel logged it: " + expected[-60:],
+          text == expected)
+opened, failed, cleared = [ev for _, ev in got]
+check("Exit Error/Open -> exit_error, not the loud arm_failed",
+      opened["event_type"] == "exit_error")
+check("Arm Failed stays the ONE loud arm_failed",
+      failed["event_type"] == "arm_failed")
+check("Arm Failed names the zone that stopped the arm",
+      failed["cause_kind"] == "zone" and failed["cause_number"] == 10
+      and failed["cause"] == ZONES[10] and failed["cause_resolved"] is True)
+check("Exit Error/Close -> exit_error_cleared",
+      cleared["event_type"] == "exit_error_cleared")
+check("exactly one of the three is arm_failed",
+      [ev["event_type"] for ev in (opened, failed, cleared)].count("arm_failed") == 1)
+_, ev = capture(make_tc(), logevent(85, 0, 99, 1, (2026, 9, 21, 15, 10, 17)))
+check("Arm Failed on an unknown zone is unresolved, never guessed",
+      ev["cause_kind"] == "zone" and ev["cause"] is None
+      and ev["cause_resolved"] is False)
+
 # --------------------------------------------------------- multi-area, misc
 _, ev = capture(make_tc(), logevent(3, 3, 23, 3, (2026, 9, 20, 12, 0, 0)))
 check("area bitmap decodes to both areas",
@@ -285,6 +317,7 @@ try:
 except Exception:
     declared = set()
 produced = set(TexecomConnect.LOG_CATEGORY_BY_EVENT.values()) \
+    | set(TexecomConnect.LOG_CATEGORY_BY_EVENT_GROUP.values()) \
     | set(TexecomConnect.LOG_CATEGORY_BY_GROUP.values()) \
     | {"tamper", "tamper_restore", "other"}
 check("HA is told about every category the library can emit",
