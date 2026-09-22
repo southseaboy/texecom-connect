@@ -96,6 +96,11 @@ class TexecomConnect(TexecomDefines):
         # attributed. Rebound, never mutated: it is written from the MQTT
         # thread and read from the main thread.
         self.resetRequest = None
+        # Arm/disarm records the panel log should have sent: area number ->
+        # (category, area event time, deadline). See infer_missing_record().
+        self.pendingInferences = {}
+        # (area number, category) -> when an arm/disarm record last arrived
+        self.lastArmDisarmRecord = {}
 
     ## texecom commands
     # in order of their command number
@@ -1002,6 +1007,117 @@ class TexecomConnect(TexecomDefines):
                 )
             )
 
+    # How long an area event waits for its arm/disarm log record. Observed
+    # 0-1 s apart, in either order.
+    INFER_WINDOW_SECS = 10
+
+    # Log record categories that account for each transition. After an alarm
+    # the panel records the disarm as 'Open After Alarm', category 'reset'.
+    ARM_DISARM_RECORDS = {
+        "arm": frozenset(["arm"]),
+        "disarm": frozenset(["disarm", "reset"]),
+    }
+
+    def expect_arm_disarm_record(self, area, previous_state, new_state, now=None):
+        """Note that a real panel area event should have a log record.
+
+        Only for events from the panel itself - never for states this app
+        works out (alarm over, exit overdue), which have no record.
+        """
+        if now is None:
+            now = time.time()
+        armed = (self.AREA_STATE_ARMED, self.AREA_STATE_PARTARMED)
+        if new_state == self.AREA_STATE_DISARMED and previous_state in armed + (
+            self.AREA_STATE_INENTRY, self.AREA_STATE_INALARM
+        ):
+            category = "disarm"
+        elif new_state in armed and previous_state in (
+            self.AREA_STATE_DISARMED, self.AREA_STATE_INEXIT
+        ):
+            category = "arm"
+        else:
+            # Anything else settles the area: drop a stale expectation.
+            self.pendingInferences.pop(area.number, None)
+            return
+        # The record can arrive BEFORE the area event.
+        for record in self.ARM_DISARM_RECORDS[category]:
+            seen = self.lastArmDisarmRecord.get((area.number, record))
+            if seen is not None and now - seen <= self.INFER_WINDOW_SECS:
+                self.pendingInferences.pop(area.number, None)
+                return
+        self.pendingInferences[area.number] = (
+            category, now, now + self.INFER_WINDOW_SECS
+        )
+
+    def note_arm_disarm_record(self, panel_event, now=None):
+        """An arm/disarm log record arrived: it accounts for its areas."""
+        if now is None:
+            now = time.time()
+        category = panel_event["event_type"]
+        for areanumber in panel_event["areas"]:
+            self.lastArmDisarmRecord[(areanumber, category)] = now
+            pending = self.pendingInferences.get(areanumber)
+            if pending is not None and category in self.ARM_DISARM_RECORDS[pending[0]]:
+                del self.pendingInferences[areanumber]
+
+    def service_pending_inferences(self, now=None):
+        """Publish an arm/disarm the panel log never delivered.
+
+        Seen 2026-09-21 20:10: the disarm record was in a frame that failed its
+        CRC, the link dropped, and the record was never seen again - no push
+        and no Activity line, though the area state was right. The Connect
+        protocol as implemented cannot read the panel log back, so the event
+        is inferred from the area state. It says so, and the user is unknown:
+        a name is never guessed (owner decision 2026-09-22).
+        """
+        if now is None:
+            now = time.time()
+        for areanumber, (category, seen_at, deadline) in list(
+            self.pendingInferences.items()
+        ):
+            if now < deadline:
+                continue
+            del self.pendingInferences[areanumber]
+            event = self.build_inferred_event(category, areanumber, seen_at)
+            self.log(
+                "inferred {} for area {:d}: no log record within {:d} s".format(
+                    category, areanumber, self.INFER_WINDOW_SECS
+                )
+            )
+            if self.panel_event_func is not None:
+                self.panel_event_func(event)
+
+    def build_inferred_event(self, category, areanumber, seen_at):
+        """The published dict for an inferred arm/disarm, same shape as a
+        real one. cause_source 'inferred' is what consumers must show."""
+        area = self.areas.get(areanumber)
+        area_name = area.text if area is not None else "Area{:d}".format(areanumber)
+        label = {"arm": "Armed", "disarm": "Disarmed"}[category]
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(seen_at))
+        return {
+            "event_type": category,
+            # No panel timestamp exists: this is when the area event arrived.
+            "panel_time": stamp,
+            "received": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "type_id": None,
+            "type": "Inferred from area state",
+            "group_id": None,
+            "group": None,
+            "cause_kind": "none",
+            "cause_number": None,
+            "cause": None,
+            "cause_resolved": False,
+            "cause_source": "inferred",
+            "areas": [areanumber],
+            "area_names": [area_name],
+            "comm_delayed": False,
+            "communicated": False,
+            "notify": category in self.LOG_CATEGORY_NOTIFY,
+            "text": "{} - inferred from area state, panel log record not received, user unknown ({})".format(
+                label, area_name
+            ),
+        }
+
     def service_alarm_flag_polling(self):
         """One tick of fast polling. Caller guarantees no command is in flight."""
         self.alarmPollNext = time.time() + self.ALARM_POLL_INTERVAL
@@ -1334,7 +1450,9 @@ class TexecomConnect(TexecomDefines):
             area_number = payload[0]
             area_state = payload[1]
             area = self.get_area(area_number)
+            previous_state = area.state
             area.save_state(area_state)
+            self.expect_arm_disarm_record(area, previous_state, area_state)
             if area_state == self.AREA_STATE_INALARM:
                 self.start_alarm_flag_polling(area_number)
             if self.area_event_func is not None:
@@ -1443,12 +1561,14 @@ class TexecomConnect(TexecomDefines):
             if communicated:
                 group_type_str += " [communicated]"
 
+            panel_event = self.build_panel_event(
+                event_type, event_str, group_type, group_name,
+                parameter, areas, timestamp_str,
+                bool(comm_delayed), bool(communicated),
+            )
+            self.note_arm_disarm_record(panel_event)
             if self.panel_event_func is not None:
-                self.panel_event_func(self.build_panel_event(
-                    event_type, event_str, group_type, group_name,
-                    parameter, areas, timestamp_str,
-                    bool(comm_delayed), bool(communicated),
-                ))
+                self.panel_event_func(panel_event)
 
             return "Log event message: {} {}, {} parameter: {:d} areas: {:d}".format(
                 timestamp_str, event_str, group_type_str, parameter, areas
@@ -1609,6 +1729,8 @@ class TexecomConnect(TexecomDefines):
                     self.next_user_refresh = time.time() + self.USER_REFRESH_SECS
                     self.log("daily user table refresh due")
                     self.siteDataChanged = True
+            if self.pendingInferences:
+                self.service_pending_inferences()
             if time.time() - self.time_last_heartbeat > self.alive_heartbeat_secs:
                 self.alive()
             #header = self.s.recv(self.LENGTH_HEADER)
