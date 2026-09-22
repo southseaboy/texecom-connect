@@ -500,6 +500,10 @@ if __name__ == "__main__":
     tc.on_zone_details(TexecomMqtt.zone_details_callback)
     tc.on_log_event(TexecomMqtt.log_event)
     tc.on_panel_event(TexecomMqtt.panel_event)
+    # Announce the event entity as soon as the panel is identified. From the
+    # first heartbeat alone it waited for the SECOND one, 5 minutes on, and
+    # HA rejects an event whose type the entity has not been told about.
+    tc.on_site_data(TexecomMqtt.announce_event_entity)
     tc.on_area_flags(TexecomMqtt.area_flags_callback)
 
     atexit.register(TexecomMqtt.exiting)

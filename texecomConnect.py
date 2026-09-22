@@ -59,6 +59,7 @@ class TexecomConnect(TexecomDefines):
         self.zone_event_func = None
         self.log_event_func = None
         self.panel_event_func = None
+        self.site_data_func = None
         self.area_flags_func = None
         self.numberOfZones = None
         self.highestUsedZone = None
@@ -1345,9 +1346,16 @@ class TexecomConnect(TexecomDefines):
         self.get_all_areas()
         self.get_all_zones()
         self.get_all_users()
+        # Panel type, zone count and the name tables are all known from here.
+        if self.site_data_func is not None:
+            self.site_data_func()
 
     def on_alive_event(self, alive_event_func):
         self.alive_event_func = alive_event_func
+
+    def on_site_data(self, site_data_func):
+        """Called after every site data read, first at startup."""
+        self.site_data_func = site_data_func
 
     def on_area_event(self, area_event_func):
         self.area_event_func = area_event_func
