@@ -933,6 +933,75 @@ class TexecomConnect(TexecomDefines):
                 )
             )
 
+    # Flags that settle an area left 'in exit': 19 Exit, 21 Armed,
+    # 23 Part Armed, 24 Part Arming.
+    AREA_FLAG_EXIT_SET = [19, 21, 23, 24]
+
+    # Used when the panel's exit delay for an area is not known.
+    EXIT_GRACE_DEFAULT_SECS = 30
+
+    def resolve_stale_exit_state(self, now=None):
+        """Settle an area still 'in exit' after its exit delay has run out.
+
+        After an Exit Error (arm failed) the panel sends no area event, so the
+        area sat 'in exit' - Home Assistant showed 'arming' - until the next
+        real arm. Seen 2026-09-21: 2 h 40 m. saveAreasCurrentArmedState()
+        cannot catch it: it keeps a known state while flag 21 is clear.
+
+        Rule agreed with the owner 2026-09-22: once the exit delay (30 s at
+        the time) has passed, take the state from the panel's flags. Disarmed
+        needs Exit, Armed, Part Armed and Part Arming all read clear; a failed
+        read decides nothing. A set Armed / Part Armed flag settles a lost
+        arm event the same way.
+
+        Costs no panel traffic unless an area is overdue.
+        """
+        if now is None:
+            now = time.time()
+        overdue = []
+        for areanumber in range(1, self.numberOfAreas + 1):
+            area = self.get_area(areanumber)
+            if area.state != self.AREA_STATE_INEXIT:
+                continue
+            if area.exitStartedAt is None:
+                # In exit without a known start - start the clock now.
+                area.exitStartedAt = now
+                continue
+            grace = getattr(area, "exitDelay", None) or self.EXIT_GRACE_DEFAULT_SECS
+            if now - area.exitStartedAt > grace:
+                overdue.append(area)
+        if not overdue:
+            return
+        bitmaps, failed = self.read_area_flags_individually(self.AREA_FLAG_EXIT_SET)
+        if failed:
+            self.log(
+                "areaFlags: {:d} of {:d} exit flags failed to read - exit state left as is".format(
+                    failed, len(self.AREA_FLAG_EXIT_SET)
+                )
+            )
+            return
+        for area in overdue:
+            if self.area_bit_set(bitmaps[19], area.number) or self.area_bit_set(
+                bitmaps[24], area.number
+            ):
+                # Panel still says exit is running (e.g. a longer exit delay).
+                continue
+            if self.area_bit_set(bitmaps[23], area.number):
+                newState = self.AREA_STATE_PARTARMED
+            elif self.area_bit_set(bitmaps[21], area.number):
+                newState = self.AREA_STATE_ARMED
+            else:
+                newState = self.AREA_STATE_DISARMED
+            area.save_state(newState)
+            if self.area_event_func is not None:
+                self.area_event_func(area)
+            self.log(
+                "areaState {:d} '{}': {:d} {} (exit overdue {:.0f} s - from panel flags)".format(
+                    area.number, area.text, area.state, area.state_text,
+                    now - area.exitStartedAt
+                )
+            )
+
     def service_alarm_flag_polling(self):
         """One tick of fast polling. Caller guarantees no command is in flight."""
         self.alarmPollNext = time.time() + self.ALARM_POLL_INTERVAL
@@ -1526,6 +1595,7 @@ class TexecomConnect(TexecomDefines):
                         self.clear_alarm_state_if_over(
                             self.log_all_area_flags("idle")
                         )
+                        self.resolve_stale_exit_state()
                 self.lastIdleCommand += 1
                 if self.lastIdleCommand == 2:
                     self.lastIdleCommand = 0

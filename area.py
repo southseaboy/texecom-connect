@@ -17,6 +17,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
+
 
 class Area:
     """Information about an area and it's current state"""
@@ -27,9 +29,13 @@ class Area:
         self.state = None
         self.state_text = None
         self.zones = {}
+        # When the area last entered 'in exit', so a failed arm can be timed out
+        self.exitStartedAt = None
 
     def save_state(self, area_state):
         """save state and decoded text"""
+        if area_state == 1 and self.state != 1:  # 1 = in exit
+            self.exitStartedAt = time.time()
         self.state = area_state
         self.state_text = [
             "disarmed",
