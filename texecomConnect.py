@@ -1145,7 +1145,9 @@ class TexecomConnect(TexecomDefines):
     # Flag 36 is the panel's own "this area still needs a reset" state, and it
     # is the only evidence available that a reset did anything: the panel
     # reports no event when the condition clears (proven 2026-09-17).
-    AREA_FLAGS_PUBLISHED = [36]
+    # Flag 66 is "Fault Present": after a mains failure it stays set until the
+    # fault is reset, and nothing else reports it (no event, no flag 36).
+    AREA_FLAGS_PUBLISHED = [36, 66]
 
     # After a reset, re-read the flags rather than waiting up to a minute for
     # the idle poll. A reset that clears nothing is itself the finding, so it
@@ -1180,11 +1182,11 @@ class TexecomConnect(TexecomDefines):
     # The flags worth reading on every poll. The panel refuses a bulk read, so
     # each one costs a round trip - keep this list short.
     #   00 Alarm, 05 24hr audible Alarm, 21 Armed, 36 Reset Required,
-    #   61 Intruder Alarm
+    #   61 Intruder Alarm, 66 Fault Present
     # 0 Alarm and 36 Reset Required are watched because they are the panel's
     # own memory of an alarm; 21 Armed gives armed/disarmed; the rest are the
     # live-alarm flags, needed so the idle poll can tell when an alarm is over.
-    AREA_FLAG_WATCHLIST = [0, 5, 21, 28, 30, 36, 44, 61, 62]
+    AREA_FLAG_WATCHLIST = [0, 5, 21, 28, 30, 36, 44, 61, 62, 66]
 
     def read_area_flags_individually(self, flagnums):
         """Read the given area flags one command at a time.

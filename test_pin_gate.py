@@ -333,6 +333,21 @@ quiet = flag_tc()
 quiet.publish_area_flags({36: bitmap(0b0001)})
 check("publishing with no callback registered is a no-op, not a crash", True)
 
+seen[:] = []
+f.publish_area_flags({66: bitmap(0b0001)})
+check("flag 66 set on area 1 only publishes True for area 1",
+      seen == [(1, 66, True), (2, 66, False), (3, 66, False), (4, 66, False)])
+
+seen[:] = []
+f.publish_area_flags({36: bitmap(0b0000), 66: bitmap(0b0010)})
+check("flags 36 and 66 are published independently",
+      [s for s in seen if s[2]] == [(2, 66, True)]
+      and (1, 36, False) in seen)
+
+check("flag 66 is polled on every idle read, and published",
+      66 in TexecomConnect.AREA_FLAG_WATCHLIST
+      and 66 in TexecomConnect.AREA_FLAGS_PUBLISHED)
+
 # ------------------------------------------------ the read-back after a reset
 rb = make_tc({})
 check("no flag read-back is pending to start with", rb.flagReadBackDue == [])
@@ -506,6 +521,29 @@ mon.TexecomMqtt.area_flags_callback(mon.tc.get_area(1), 21, True)
 check("a flag with no sensor defined publishes nothing",
       "homeassistant/binary_sensor/reset_required_intruder" not in
       [t.rsplit("/", 1)[0] for t in published if "21" in t])
+
+mon.TexecomMqtt.flag_sensors_announced = set()
+published.clear()
+for n in range(1, 5):
+    mon.TexecomMqtt.area_flags_callback(mon.tc.get_area(n), 66, n == 1)
+fcfg1 = published["homeassistant/binary_sensor/fault_present_intruder/config"]
+fcfg2 = published["homeassistant/binary_sensor/fault_present_fire_co_alarms/config"]
+check("the fault sensor is named for what it is",
+      fcfg1["name"] == "Fault present " + mon.tc.get_area(1).text)
+check("the fault sensor is enabled only for the commandable area",
+      fcfg1["enabled_by_default"] is True and fcfg2["enabled_by_default"] is False)
+check("the fault sensor reads as a problem and has its own unique_id",
+      fcfg1["device_class"] == "problem"
+      and fcfg1["unique_id"] == "Elite.areaflag.66.intruder")
+check("the fault sensor state is True for the area with the flag set",
+      published["homeassistant/binary_sensor/fault_present_intruder/state"] == "True"
+      and published["homeassistant/binary_sensor/fault_present_fire_co_alarms/state"] == "False")
+mon.TexecomMqtt.flag_sensors_announced = set()
+published.clear()
+mon.TexecomMqtt.area_flags_callback(mon.tc.get_area(1), 36, False)
+check("the reset sensor keeps its original name",
+      published["homeassistant/binary_sensor/reset_required_intruder/config"]["name"]
+      == "Reset required " + mon.tc.get_area(1).text)
 
 # ----------------------------------------------------- the audit line is stamped
 lines = []

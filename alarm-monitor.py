@@ -301,9 +301,10 @@ class TexecomMqtt:
             print("MQTT Update %s: %s" % (topic, area_state_str))
         client.publish(topic, area_state_str, retain=True)
 
-    # Area flags published as their own binary sensor: {flag: (slug, class)}.
+    # Area flags published as their own binary sensor: {flag: (slug, class, label)}.
     AREA_FLAG_SENSORS = {
-        36: ("reset_required", "problem"),
+        36: ("reset_required", "problem", "Reset required"),
+        66: ("fault_present", "problem", "Fault present"),
     }
     # Discovery configs already published this run, so that the state publish
     # on every poll does not republish them every 60 seconds.
@@ -314,7 +315,7 @@ class TexecomMqtt:
         """Publish one area flag. Called on every flag poll, per area."""
         if flagnum not in TexecomMqtt.AREA_FLAG_SENSORS:
             return
-        slug, device_class = TexecomMqtt.AREA_FLAG_SENSORS[flagnum]
+        slug, device_class, label = TexecomMqtt.AREA_FLAG_SENSORS[flagnum]
         areaname = str.lower((area.text).replace(" ", "_"))
         name = slug + "_" + areaname
         topicbase = topic_root + "/binary_sensor/" + name
@@ -322,7 +323,7 @@ class TexecomMqtt:
         if name not in TexecomMqtt.flag_sensors_announced:
             configtopic = config_root + "/binary_sensor/" + name + "/config"
             message = {
-                "name": "Reset required " + area.text,
+                "name": label + " " + area.text,
                 "device_class": device_class,
                 "state_topic": statetopic,
                 "payload_on": "True",
